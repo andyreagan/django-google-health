@@ -1,6 +1,350 @@
 """Map Google Health API payloads onto django-healthdatamodel records.
 
-Public entry points will call ``healthdatamodel.ingest.ingest_records`` and
-``healthdatamodel.schemas.RecordInput`` / ``WorkoutInput``; this module is the
-only place that knows about the Google Health response shape.
+Six mappers cover the beachhead data types:
+
+  steps, total-calories, heart-rate, weight  → :class:`RecordInput` (Sample/Interval)
+  sleep                                       → list[:class:`RecordInput`] (one per stage)
+  exercise                                    → ``Workout`` row via direct ORM write
+
+Caveats — Google Health's data model isn't 1:1 with Apple HealthKit (which is what
+``healthdatamodel`` schemas mirror):
+
+* Google exposes a single ``total-calories`` type. We map it to
+  ``ActivityMetric.ACTIVE_CALORIES`` because that's the closest semantic match
+  (Fitbit's caloriesOut historically lands there). ``BASAL_CALORIES`` is not
+  available from the Google Health API.
+* ``healthdatamodel`` does not yet have a public ``ingest_workouts()`` helper, so
+  exercise sessions are persisted via ``Workout.objects.create`` directly. This is
+  a stopgap; when the upstream package exposes a public API, lift this over.
+
+The high-level orchestrator is :func:`sync_user`.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable
+
+from healthdatamodel.ingest import ingest_records
+from healthdatamodel.models import Workout, WorkoutMetadataEntry
+from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
+from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
+
+from .client import GoogleHealthClient
+from .constants import (
+    DATA_SOURCE,
+    DATA_TYPE_EXERCISE,
+    DATA_TYPE_HEART_RATE,
+    DATA_TYPE_SLEEP,
+    DATA_TYPE_STEPS,
+    DATA_TYPE_TOTAL_CALORIES,
+    DATA_TYPE_WEIGHT,
+    SOURCE_NAME,
+)
+
+if TYPE_CHECKING:
+    from .models import GoogleHealthConnection
+
+# Apple HealthKit identifiers not exported as enum members in healthdatamodel.
+HK_HEART_RATE = "HKQuantityTypeIdentifierHeartRate"
+HK_BODY_MASS = "HKQuantityTypeIdentifierBodyMass"
+
+# Map Google's sleep stage strings → healthdatamodel SleepValue.
+_SLEEP_STAGE_MAP: dict[str, str] = {
+    "LIGHT": SleepValue.ASLEEP_CORE,
+    "DEEP": SleepValue.ASLEEP_DEEP,
+    "REM": SleepValue.ASLEEP_REM,
+    "AWAKE": SleepValue.AWAKE,
+    "IN_BED": SleepValue.IN_BED,
+    "UNSPECIFIED": SleepValue.ASLEEP_UNSPECIFIED,
+    "OUT_OF_BED": SleepValue.AWAKE,
+}
+
+
+@dataclass
+class SyncResult:
+    """Per-type counts returned by :func:`sync_user`."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: datetime | None = None
+
+    @property
+    def total(self) -> int:
+        return sum(self.counts.values())
+
+
+def _parse_dt(value: str | None) -> datetime:
+    if not value:
+        raise ValueError("missing datetime value")
+    # Google returns RFC3339 with Z suffix, e.g. "2026-02-23T13:10:00Z".
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _record_id(data_point: dict[str, Any]) -> str | None:
+    # Last segment of "users/{id}/dataTypes/{type}/dataPoints/{record_id}"
+    name = data_point.get("name")
+    if not name:
+        return None
+    return name.rsplit("/", 1)[-1]
+
+
+def _interval_bounds(value: dict[str, Any]) -> tuple[datetime, datetime]:
+    interval = value.get("interval") or {}
+    return _parse_dt(interval.get("startTime")), _parse_dt(interval.get("endTime"))
+
+
+def _common_record_fields(data_point: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "recordId": _record_id(data_point),
+        "creationDate": _parse_dt(_update_time(data_point)),
+        "sourceName": SOURCE_NAME,
+    }
+
+
+def _update_time(data_point: dict[str, Any]) -> str | None:
+    # The update_time lives nested under the type block, e.g. data_point["exercise"]["updateTime"].
+    for block in data_point.values():
+        if isinstance(block, dict) and "updateTime" in block:
+            return block["updateTime"]
+    return None
+
+
+# Mappers ---------------------------------------------------------------------
+
+
+def map_steps(data_point: dict[str, Any]) -> RecordInput:
+    block = data_point["steps"]
+    start, end = _interval_bounds(block)
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=str(ActivityMetric.STEPS),
+        value=str(block.get("stepCount", "0")),
+        unit="count",
+    )
+
+
+def map_total_calories(data_point: dict[str, Any]) -> RecordInput:
+    block = data_point["totalCalories"]
+    start, end = _interval_bounds(block)
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=str(ActivityMetric.ACTIVE_CALORIES),
+        value=str(block.get("caloriesKcal", "0")),
+        unit="kcal",
+    )
+
+
+def map_heart_rate(data_point: dict[str, Any]) -> RecordInput:
+    block = data_point["heartRate"]
+    # Heart-rate is a Sample (point-in-time). Use the same instant for start and end.
+    instant = _parse_dt(block.get("time"))
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=instant,
+        endDate=instant,
+        type=HK_HEART_RATE,
+        value=str(block.get("beatsPerMinute", "0")),
+        unit="count/min",
+    )
+
+
+def map_weight(data_point: dict[str, Any]) -> RecordInput:
+    block = data_point["weight"]
+    instant = _parse_dt(block.get("time"))
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=instant,
+        endDate=instant,
+        type=HK_BODY_MASS,
+        value=str(block.get("weightKg", "0")),
+        unit="kg",
+    )
+
+
+def map_sleep_session(data_point: dict[str, Any]) -> list[RecordInput]:
+    """Decompose a Google sleep session into one Record per stage interval."""
+    block = data_point["sleep"]
+    common = _common_record_fields(data_point)
+    records: list[RecordInput] = []
+    for stage in block.get("stages") or []:
+        start, end = _interval_bounds(stage)
+        mapped = _SLEEP_STAGE_MAP.get(str(stage.get("stage", "")).upper())
+        if mapped is None:
+            continue
+        records.append(
+            RecordInput(
+                **common,
+                startDate=start,
+                endDate=end,
+                type=SLEEP_TYPE,
+                value=mapped,
+            )
+        )
+    return records
+
+
+def map_exercise(data_point: dict[str, Any]) -> WorkoutInput:
+    block = data_point["exercise"]
+    start, end = _interval_bounds(block)
+    metrics = block.get("metricsSummary") or {}
+    duration_seconds = (end - start).total_seconds()
+    distance_mm = metrics.get("distanceMillimeters") or metrics.get(
+        "distanceMillimiters"
+    )
+    distance_value: float | None = None
+    if distance_mm is not None:
+        distance_value = float(distance_mm) / 1_000_000.0  # mm → km
+
+    extra_metadata: list[MetadataEntry] = []
+    if "steps" in metrics:
+        extra_metadata.append(MetadataEntry(key="steps", value=str(metrics["steps"])))
+    if "averageHeartRateBeatsPerMinute" in metrics:
+        extra_metadata.append(
+            MetadataEntry(
+                key="average_heart_rate_bpm",
+                value=str(metrics["averageHeartRateBeatsPerMinute"]),
+            )
+        )
+
+    return WorkoutInput(
+        recordId=_record_id(data_point),
+        startDate=start,
+        endDate=end,
+        creationDate=_parse_dt(block.get("updateTime")),
+        sourceName=SOURCE_NAME,
+        durationUnit="s",
+        duration=duration_seconds,
+        workoutActivityType=str(block.get("exerciseType", "UNKNOWN")),
+        caloriesBurned=float(metrics["caloriesKcal"])
+        if "caloriesKcal" in metrics
+        else None,
+        caloriesUnit="kcal" if "caloriesKcal" in metrics else None,
+        distance=distance_value,
+        distanceUnit="km" if distance_value is not None else None,
+        metadataEntry=extra_metadata or None,
+    )
+
+
+# Workout persistence ---------------------------------------------------------
+
+
+def _ingest_workouts(
+    customer: Any,
+    workouts: list[WorkoutInput],
+    *,
+    source: str = DATA_SOURCE,
+    admin_create_date: datetime | None = None,
+) -> None:
+    """Persist workouts via direct ORM writes.
+
+    Stopgap until ``healthdatamodel`` exposes a public ``ingest_workouts()``.
+    """
+    _ = admin_create_date  # auto-set on the model
+    for w in workouts:
+        workout = Workout.objects.create(
+            customer=customer,
+            startDate=w.startDate,
+            endDate=w.endDate,
+            creationDate=w.creationDate,
+            sourceVersion=w.sourceVersion,
+            sourceName=w.sourceName,
+            source=source,
+            device=w.device,
+            durationUnit=w.durationUnit,
+            duration=int(w.duration),
+            workoutActivityType=w.workoutActivityType,
+        )
+        for entry in w.metadataEntry or []:
+            WorkoutMetadataEntry.objects.create(
+                workout=workout, key=entry.key, value=entry.value
+            )
+        # caloriesBurned and distance aren't first-class columns on Workout; stash via metadata.
+        if w.caloriesBurned is not None:
+            WorkoutMetadataEntry.objects.create(
+                workout=workout, key="caloriesBurned", value=str(w.caloriesBurned)
+            )
+        if w.distance is not None:
+            WorkoutMetadataEntry.objects.create(
+                workout=workout, key="distance_km", value=str(w.distance)
+            )
+
+
+# Orchestrator ----------------------------------------------------------------
+
+
+_RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
+    DATA_TYPE_STEPS: lambda dp: [map_steps(dp)],
+    DATA_TYPE_TOTAL_CALORIES: lambda dp: [map_total_calories(dp)],
+    DATA_TYPE_HEART_RATE: lambda dp: [map_heart_rate(dp)],
+    DATA_TYPE_WEIGHT: lambda dp: [map_weight(dp)],
+    DATA_TYPE_SLEEP: map_sleep_session,
+}
+
+DEFAULT_DATA_TYPES: tuple[str, ...] = (
+    DATA_TYPE_STEPS,
+    DATA_TYPE_TOTAL_CALORIES,
+    DATA_TYPE_HEART_RATE,
+    DATA_TYPE_WEIGHT,
+    DATA_TYPE_SLEEP,
+    DATA_TYPE_EXERCISE,
+)
+
+
+def _interval_filter(google_filter_key: str, start: datetime, end: datetime) -> str:
+    return (
+        f'{google_filter_key}.interval.start_time >= "{start.isoformat()}" '
+        f'AND {google_filter_key}.interval.end_time <= "{end.isoformat()}"'
+    )
+
+
+def sync_user(
+    connection: GoogleHealthConnection,
+    *,
+    start: datetime,
+    end: datetime,
+    data_types: list[str] | None = None,
+    client: GoogleHealthClient | None = None,
+) -> SyncResult:
+    """Fetch + ingest all configured data types for ``connection`` over [start, end].
+
+    Pass a pre-built ``client`` to override the default (useful in tests).
+    """
+    result = SyncResult()
+    owns_client = client is None
+    if client is None:
+        client = GoogleHealthClient(connection)
+
+    try:
+        for data_type in data_types or DEFAULT_DATA_TYPES:
+            filter_key = data_type.replace("-", "_")
+            filter_expr = _interval_filter(filter_key, start, end)
+            data_points = list(client.iter_data_points(data_type, filter=filter_expr))
+
+            if data_type == DATA_TYPE_EXERCISE:
+                workouts = [map_exercise(dp) for dp in data_points]
+                _ingest_workouts(connection.customer, workouts)
+                result.counts[data_type] = len(workouts)
+                continue
+
+            mapper = _RECORD_MAPPERS.get(data_type)
+            if mapper is None:
+                continue
+            records: list[RecordInput] = []
+            for dp in data_points:
+                records.extend(mapper(dp))
+            ingest_records(connection.customer, records, source=DATA_SOURCE)
+            result.counts[data_type] = len(records)
+    finally:
+        if owns_client:
+            client.close()
+
+    connection.last_sync_at = datetime.now(timezone.utc)
+    connection.save(update_fields=["last_sync_at"])
+    result.finished_at = datetime.now(timezone.utc)
+    return result

@@ -57,4 +57,6 @@ DATA_TYPE_TOTAL_CALORIES = "total-calories"
 DATA_TYPE_WEIGHT = "weight"
 
 # Identifier used when persisting records through django-healthdatamodel.
-DATA_SOURCE = "google-health"
+# Underscore form matches upstream DataSource members (apple_health, health_connect).
+DATA_SOURCE = "google_health"
+SOURCE_NAME = "Google Health"  # human-readable, stored in Record.sourceName
