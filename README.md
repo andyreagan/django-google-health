@@ -91,3 +91,61 @@ uv sync --group dev
 uv run pytest tests/ -v
 uv run pre-commit run --all-files
 ```
+
+## Live integration tests
+
+The default test suite mocks all HTTP with [respx](https://lundberg.github.io/respx/) and runs offline. A small subset (marked `@pytest.mark.live`) hits the real `health.googleapis.com` and is skipped unless you set up real credentials.
+
+You need three environment variables, all sourced from your own Google Cloud project:
+
+```
+GOOGLE_HEALTH_TEST_CLIENT_ID
+GOOGLE_HEALTH_TEST_CLIENT_SECRET
+GOOGLE_HEALTH_TEST_REFRESH_TOKEN
+```
+
+### 1. Create the OAuth client (one-time)
+
+Follow the codelab in `docs/google-health/codelabs-make-your-first-api-call.md` for the full walkthrough. Condensed:
+
+1. Sign in to [Google Cloud Console](https://console.cloud.google.com/), create a project, and enable the **Google Health API** under **APIs & Services → Library**.
+2. **APIs & Services → Credentials → + Create Credentials → OAuth client ID**. Application type: **Web application**. Add `https://www.google.com` to **Authorized redirect URIs** — Google's homepage is the simplest receiver for a one-time manual exchange.
+3. Save the client ID and client secret. **The secret is shown only once.**
+4. Under **Audience**, add your own Google account (the one signed into the Fitbit app) as a **Test user**.
+5. Under **Data Access**, add the scopes you want to test against. For a smoke test of the activity endpoints, `.../auth/googlehealth.activity_and_fitness.readonly` is enough.
+
+### 2. Run the consent flow and capture a refresh token (one-time)
+
+Open this URL in a browser (substituting your client ID), sign in as the test user, and click through the consent screen. `access_type=offline&prompt=consent` guarantees a refresh token even on repeat consents:
+
+```
+https://accounts.google.com/o/oauth2/v2/auth?client_id=YOUR_CLIENT_ID&redirect_uri=https://www.google.com&response_type=code&access_type=offline&prompt=consent&scope=https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly
+```
+
+After consenting you'll land on `https://www.google.com/?code=<AUTH_CODE>&scope=...`. Copy the value between `code=` and `&scope=`.
+
+Exchange that code for tokens (one shot — auth codes are single-use):
+
+```
+curl -s https://oauth2.googleapis.com/token \
+  -d code=YOUR_AUTH_CODE \
+  -d client_id=YOUR_CLIENT_ID \
+  -d client_secret=YOUR_CLIENT_SECRET \
+  -d redirect_uri=https://www.google.com \
+  -d grant_type=authorization_code
+```
+
+Pluck `refresh_token` out of the JSON response and store it somewhere safe. Access tokens expire in 1 hour; the test harness uses the refresh token to mint fresh ones, so you only repeat this step if your refresh token expires (6 months of inactivity) or you revoke consent.
+
+### 3. Run the live tests
+
+```
+export GOOGLE_HEALTH_TEST_CLIENT_ID=...
+export GOOGLE_HEALTH_TEST_CLIENT_SECRET=...
+export GOOGLE_HEALTH_TEST_REFRESH_TOKEN=...
+uv run pytest tests/ -v -m live
+```
+
+The default `pytest` run skips these. CI does not run live tests — they need credentials that aren't safe to commit.
+
+> The Fitbit mobile app needs to have data in your account for most endpoints to return anything. The codelab walks through manually logging a Walk activity if you don't already have data.
