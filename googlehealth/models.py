@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from django.conf import settings
 from django.db import models
 
@@ -41,3 +43,14 @@ class GoogleHealthConnection(models.Model):
         return (
             f"GoogleHealthConnection(customer={self.customer_id}, status={self.status})"
         )
+
+    def is_token_expired(
+        self, *, leeway_seconds: int = 60, now: datetime | None = None
+    ) -> bool:
+        """True if the access token is at or past ``token_expires_at - leeway``.
+
+        The leeway buys time for an in-flight request to complete with the same
+        token without bumping into Google's 1-hour cutoff.
+        """
+        anchor = now or datetime.now(timezone.utc)
+        return anchor >= self.token_expires_at - timedelta(seconds=leeway_seconds)

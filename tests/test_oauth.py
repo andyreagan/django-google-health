@@ -1,0 +1,219 @@
+import os
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+import respx
+import responses
+from httpx import Response
+
+from googlehealth import oauth
+from googlehealth.constants import (
+    API_BASE_URL,
+    API_VERSION,
+    OAUTH_REVOKE_URL,
+    OAUTH_TOKEN_URL,
+    SCOPE_ACTIVITY_AND_FITNESS_READONLY,
+    SCOPE_SLEEP_READONLY,
+)
+from googlehealth.models import ConnectionStatus, GoogleHealthConnection
+from googlehealth.schemas import GoogleTokens
+
+SCOPES = [SCOPE_ACTIVITY_AND_FITNESS_READONLY, SCOPE_SLEEP_READONLY]
+
+
+def _auth_url_params(url: str) -> dict[str, str]:
+    return {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+
+
+def test_build_authorization_url_uses_pkce():
+    url, flow_state = oauth.build_authorization_url(scopes=SCOPES)
+    params = _auth_url_params(url)
+
+    assert params["access_type"] == "offline"
+    assert params["prompt"] == "consent"
+    assert params["code_challenge_method"] == "S256"
+    assert "code_challenge" in params
+    assert flow_state.code_verifier is not None
+    assert flow_state.state == params["state"]
+    assert flow_state.scopes == SCOPES
+
+
+@responses.activate
+def test_exchange_code_happy_path():
+    responses.add(
+        responses.POST,
+        OAUTH_TOKEN_URL,
+        json={
+            "access_token": "ya29.new",
+            "expires_in": 3600,
+            "refresh_token": "1//new-refresh",
+            "token_type": "Bearer",
+            "scope": " ".join(SCOPES),
+        },
+    )
+
+    tokens = oauth.exchange_code(code="auth-code-abc", scopes=SCOPES)
+
+    assert isinstance(tokens, GoogleTokens)
+    assert tokens.access_token == "ya29.new"
+    assert tokens.refresh_token == "1//new-refresh"
+    assert tokens.scopes == SCOPES
+
+
+def test_exchange_code_state_mismatch_raises_without_http_call():
+    with pytest.raises(oauth.StateMismatchError):
+        oauth.exchange_code(
+            code="x",
+            scopes=SCOPES,
+            expected_state="abc",
+            received_state="xyz",
+        )
+
+
+@respx.mock
+def test_ingest_tokens_creates_connection_and_fetches_user_id(customer):
+    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity").mock(
+        return_value=Response(200, json={"googleUserId": "999-google-id"})
+    )
+
+    tokens = GoogleTokens(
+        access_token="ya29.x",
+        expires_in=3600,
+        refresh_token="1//y",
+        scope=" ".join(SCOPES),
+    )
+
+    conn = oauth.ingest_tokens(customer=customer, tokens=tokens)
+
+    assert conn.google_user_id == "999-google-id"
+    assert conn.access_token == "ya29.x"
+    assert conn.refresh_token == "1//y"
+    assert conn.scopes == SCOPES
+    assert conn.status == ConnectionStatus.ACTIVE
+    assert GoogleHealthConnection.objects.count() == 1
+
+
+def test_ingest_tokens_skips_identity_fetch_when_user_id_supplied(customer):
+    tokens = GoogleTokens(
+        access_token="ya29.x", expires_in=3600, refresh_token="1//y", scope=SCOPES[0]
+    )
+    # No respx mock set up — proves we don't hit the network.
+    conn = oauth.ingest_tokens(
+        customer=customer, tokens=tokens, google_user_id="passed-in-id"
+    )
+    assert conn.google_user_id == "passed-in-id"
+
+
+@respx.mock
+def test_ingest_tokens_updates_existing_connection(customer, connection):
+    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/identity").mock(
+        return_value=Response(200, json={"googleUserId": connection.google_user_id})
+    )
+    tokens = GoogleTokens(
+        access_token="ya29.rotated",
+        expires_in=3600,
+        refresh_token="1//rotated",
+        scope=SCOPES[0],
+    )
+
+    updated = oauth.ingest_tokens(customer=customer, tokens=tokens)
+
+    assert updated.pk == connection.pk
+    assert updated.access_token == "ya29.rotated"
+    assert GoogleHealthConnection.objects.count() == 1
+
+
+@responses.activate
+def test_refresh_access_token(connection):
+    responses.add(
+        responses.POST,
+        OAUTH_TOKEN_URL,
+        json={
+            "access_token": "ya29.refreshed",
+            "expires_in": 3600,
+            "scope": " ".join(SCOPES),
+            "token_type": "Bearer",
+        },
+    )
+
+    refreshed = oauth.refresh_access_token(connection)
+
+    assert refreshed.access_token == "ya29.refreshed"
+    assert refreshed.refresh_token == "1//initial-refresh"  # unchanged
+    assert refreshed.token_expires_at > datetime.now(timezone.utc) + timedelta(
+        minutes=50
+    )
+
+
+@respx.mock
+def test_revoke_marks_connection_revoked(connection):
+    respx.post(OAUTH_REVOKE_URL).mock(return_value=Response(200))
+
+    oauth.revoke(connection)
+    connection.refresh_from_db()
+
+    assert connection.status == ConnectionStatus.REVOKED
+
+
+@respx.mock
+def test_revoke_swallows_http_errors(connection):
+    respx.post(OAUTH_REVOKE_URL).mock(return_value=Response(400, json={"error": "x"}))
+
+    oauth.revoke(connection)
+    connection.refresh_from_db()
+
+    assert connection.status == ConnectionStatus.REVOKED
+
+
+def test_is_token_expired_true_when_past_expiry(connection):
+    connection.token_expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    assert connection.is_token_expired() is True
+
+
+def test_is_token_expired_false_when_well_in_future(connection):
+    connection.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    assert connection.is_token_expired() is False
+
+
+def test_is_token_expired_respects_leeway(connection):
+    connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    assert connection.is_token_expired(leeway_seconds=60) is True
+    assert connection.is_token_expired(leeway_seconds=10) is False
+
+
+@pytest.mark.live
+def test_refresh_against_real_google(db):
+    """Refresh a real refresh token against ``oauth2.googleapis.com``.
+
+    Set ``GOOGLE_HEALTH_TEST_{CLIENT_ID,CLIENT_SECRET,REFRESH_TOKEN}`` in env to enable.
+    """
+    refresh_token = os.getenv("GOOGLE_HEALTH_TEST_REFRESH_TOKEN")
+    client_id = os.getenv("GOOGLE_HEALTH_TEST_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_HEALTH_TEST_CLIENT_SECRET")
+    if not (refresh_token and client_id and client_secret):
+        pytest.skip("set GOOGLE_HEALTH_TEST_* env vars to enable")
+
+    from django.conf import settings
+    from django.contrib.auth import get_user_model
+
+    settings.GOOGLE_HEALTH_CLIENT_ID = client_id
+    settings.GOOGLE_HEALTH_CLIENT_SECRET = client_secret
+
+    User = get_user_model()
+    customer = User.objects.create_user(username="live-test")
+    conn = GoogleHealthConnection.objects.create(
+        customer=customer,
+        google_user_id="placeholder",
+        access_token="placeholder",
+        refresh_token=refresh_token,
+        token_expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        scopes=[],
+    )
+
+    refreshed = oauth.refresh_access_token(conn)
+
+    assert refreshed.access_token.startswith("ya29.")
+    assert refreshed.token_expires_at > datetime.now(timezone.utc) + timedelta(
+        minutes=50
+    )

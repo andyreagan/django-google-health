@@ -31,6 +31,8 @@ requires-python = ">=3.10"
 dependencies = [
     "django",
     "django-healthdatamodel>=0.3.4",
+    "google-auth>=2.30",
+    "google-auth-oauthlib>=1.2",
     "httpx",
     "pydantic>=2",
     "python-dateutil",
@@ -52,8 +54,12 @@ dev = [
     "pytest-django",
     "pytest-freezer",
     "respx",
+    "responses",
 ]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 asyncio_mode = "auto"
+markers = [
+    "live: requires real Google OAuth credentials in env (GOOGLE_HEALTH_TEST_*)",
+]
