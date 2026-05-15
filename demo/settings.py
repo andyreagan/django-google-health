@@ -2,8 +2,18 @@
 
 Demonstrates installing both ``healthdatamodel`` (storage) and ``googlehealth``
 (this app) alongside Django's built-in apps.
+
+Google OAuth credentials, scopes, and webhook secret are read from environment
+variables so you can run the demo without editing this file:
+
+* ``GOOGLE_HEALTH_CLIENT_ID``
+* ``GOOGLE_HEALTH_CLIENT_SECRET``
+* ``GOOGLE_HEALTH_REDIRECT_URI`` (must EXACTLY match what's registered in
+  Google Cloud Console, including the trailing slash)
+* ``GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION`` (optional, only for webhook testing)
 """
 
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -61,7 +71,12 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 USE_TZ = True
 
-# Google Health API credentials (set via environment in a real deployment).
-GOOGLE_HEALTH_CLIENT_ID = ""
-GOOGLE_HEALTH_CLIENT_SECRET = ""
-GOOGLE_HEALTH_REDIRECT_URI = "http://localhost:8000/google-health/callback"
+GOOGLE_HEALTH_CLIENT_ID = os.environ.get("GOOGLE_HEALTH_CLIENT_ID", "")
+GOOGLE_HEALTH_CLIENT_SECRET = os.environ.get("GOOGLE_HEALTH_CLIENT_SECRET", "")
+GOOGLE_HEALTH_REDIRECT_URI = os.environ.get(
+    "GOOGLE_HEALTH_REDIRECT_URI",
+    "http://localhost:8000/google-health/callback/",
+)
+GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION = os.environ.get(
+    "GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION", ""
+)

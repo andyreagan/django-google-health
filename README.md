@@ -71,18 +71,69 @@ The Google Health API documentation is vendored as Markdown under `docs/google-h
 - `migration-parity-tool.md` — parity tool reference
 - `support.md` — issue tracker and forum links
 
-## Demo project
+## Demo project — end-to-end sync against your own Google account
 
-The repo includes a runnable demo Django project under `demo/`:
+The repo includes a runnable demo Django project at `demo/` that you can use to
+go through the full OAuth flow and sync your own Google Health data into
+`healthdatamodel`.
+
+### 1. Set up a Google Cloud OAuth client
+
+Follow `docs/google-health/codelabs-make-your-first-api-call.md`. Two things
+specific to the demo:
+
+- **Application type:** Web application.
+- **Authorized redirect URI:** `http://localhost:8000/google-health/callback/`
+  (exact match, trailing slash matters).
+- Add yourself as a test user under **Audience**, and add the scopes you want
+  from `googlehealth.constants` under **Data Access**. A good starter set is
+  `.activity_and_fitness.readonly`, `.health_metrics_and_measurements.readonly`,
+  `.sleep.readonly`.
+
+### 2. Run the demo
 
 ```
 uv sync
 uv run python manage.py migrate
 uv run python manage.py createsuperuser
+export GOOGLE_HEALTH_CLIENT_ID=...
+export GOOGLE_HEALTH_CLIENT_SECRET=...
+# Google's oauthlib refuses non-HTTPS redirect URIs unless you tell it otherwise.
+# This is fine for local dev only:
+export OAUTHLIB_INSECURE_TRANSPORT=1
 uv run python manage.py runserver
 ```
 
-Visit http://localhost:8000/admin/ to browse the `googlehealth` and `healthdatamodel` apps.
+### 3. Connect
+
+1. Open <http://localhost:8000/admin/> and log in with the superuser you just
+   created.
+2. In the same browser session, visit
+   <http://localhost:8000/google-health/connect/>. You'll be redirected to
+   Google's consent screen. Approve, and Google redirects back to
+   `/google-health/callback/` which writes a `GoogleHealthConnection` for your
+   user.
+
+### 4. Sync data
+
+Back in the terminal:
+
+```
+uv run python manage.py sync_google_health --user <your-username> --days 7
+```
+
+The command prints a per-data-type record count. Open
+<http://localhost:8000/admin/healthdatamodel/record/> to browse what landed.
+Workouts are under
+<http://localhost:8000/admin/healthdatamodel/workout/>.
+
+### 5. Disconnect (optional)
+
+```
+curl -X POST http://localhost:8000/google-health/disconnect/ -b "<session cookie>"
+```
+
+…or just delete the `GoogleHealthConnection` from the admin.
 
 ## Development
 
