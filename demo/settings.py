@@ -84,3 +84,7 @@ GOOGLE_HEALTH_REDIRECT_URI = os.environ.get(
 GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION = os.environ.get(
     "GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION", ""
 )
+
+# Where googlehealth.views.callback / disconnect redirect to. Library default
+# is /admin/; for the demo we want the user-facing homepage.
+GOOGLE_HEALTH_CONNECT_SUCCESS_URL = "/"
