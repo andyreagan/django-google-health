@@ -15,6 +15,7 @@ Thin layer on top of ``google-auth-oauthlib``. The public API is:
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from datetime import datetime, timezone
@@ -43,6 +44,8 @@ from .schemas import GoogleTokens, OAuthFlowState  # noqa: E402
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
+
+log = logging.getLogger(__name__)
 
 
 class OAuthError(Exception):
@@ -137,7 +140,16 @@ def ingest_tokens(
         else GoogleTokens.model_validate(tokens)
     )
     if google_user_id is None:
-        google_user_id = _fetch_google_user_id(parsed.access_token)
+        try:
+            google_user_id = _fetch_google_user_id(parsed.access_token)
+        except (httpx.HTTPError, OAuthError) as exc:
+            # The OAuth flow itself succeeded; identity is only needed for webhook
+            # routing. Store empty and let a later step resolve it (e.g. a manual
+            # call to _fetch_google_user_id once the API issue is sorted).
+            log.warning(
+                "users.getIdentity failed (%s) — storing empty google_user_id", exc
+            )
+            google_user_id = ""
 
     connection, _ = GoogleHealthConnection.objects.update_or_create(
         customer=customer,
@@ -203,7 +215,11 @@ def _fetch_google_user_id(access_token: str) -> str:
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=10.0,
     )
-    response.raise_for_status()
+    if response.status_code >= 400:
+        # raise_for_status drops the response body; we want it visible.
+        raise OAuthError(
+            f"users.getIdentity returned HTTP {response.status_code}: {response.text}"
+        )
     payload = response.json()
     user_id = payload.get("googleUserId") or payload.get("healthUserId")
     if not user_id:
