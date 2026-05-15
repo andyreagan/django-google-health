@@ -51,6 +51,11 @@ db.sqlite3-journal
 media/
 staticfiles/
 
+# Local env vars (never commit — they hold OAuth secrets)
+.env
+.env.*
+!.env.example
+
 # Editors / OS
 .idea/
 .vscode/
