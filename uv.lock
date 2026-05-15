@@ -392,7 +392,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "django" },
-    { name = "django-healthdatamodel", specifier = ">=0.3.4" },
+    { name = "django-healthdatamodel", specifier = ">=0.4.0" },
     { name = "google-auth", specifier = ">=2.30" },
     { name = "google-auth-oauthlib", specifier = ">=1.2" },
     { name = "httpx" },
@@ -413,7 +413,7 @@ dev = [
 
 [[package]]
 name = "django-healthdatamodel"
-version = "0.3.4"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "django", version = "5.2.14", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -421,9 +421,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-dateutil" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/22/4ad0d1efd5c63201b536e87770ceaeeef1c4bb32810f2dff4a01aa2f7d7c/django_healthdatamodel-0.3.4.tar.gz", hash = "sha256:bcc4c11ebb27227c61c2188e7e94c6efa0eb754fc5b159c923a9a1dd2013d194", size = 54272, upload-time = "2026-05-11T17:24:41.816Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/84/ad/2b8416f7a1e868b15f8f84d2597b2aae7fd63286bd42ceb1ca66271b32c1/django_healthdatamodel-0.4.0.tar.gz", hash = "sha256:8d058caa5d5b918d39651ff75edd23515f9e58f2f67e3a153abcd06f094d3858", size = 55864, upload-time = "2026-05-15T02:05:42.253Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/02/95/3db6e7a4a39f7746360570c15b6c460d7047bc408212240f47a4f931038b/django_healthdatamodel-0.3.4-py3-none-any.whl", hash = "sha256:a1938b98cd0b0c757fefb87cd417f30e361a313bc466e063c5480226f3417621", size = 23959, upload-time = "2026-05-11T17:24:40.575Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/21/f8e1642c787e6295e451919fa00af79f464fc4f8c48fb61b3725258ab7ce/django_healthdatamodel-0.4.0-py3-none-any.whl", hash = "sha256:ecacff5827cafff2d44932e7dcc228ad916a93b3c3c1427a7243c40fa6598aba", size = 24717, upload-time = "2026-05-15T02:05:40.958Z" },
 ]
 
 [[package]]

@@ -1,10 +1,13 @@
 """Map Google Health API payloads onto django-healthdatamodel records.
 
-Six mappers cover the beachhead data types:
+Mappers cover the beachhead data types:
 
   steps, total-calories, heart-rate, weight  → :class:`RecordInput` (Sample/Interval)
   sleep                                       → list[:class:`RecordInput`] (one per stage)
-  exercise                                    → ``Workout`` row via direct ORM write
+  exercise                                    → :class:`WorkoutInput`
+
+Plus the secondary set: distance, altitude, floors, active-zone-minutes,
+daily-resting-heart-rate, daily-oxygen-saturation, body-fat.
 
 Caveats — Google Health's data model isn't 1:1 with Apple HealthKit (which is what
 ``healthdatamodel`` schemas mirror):
@@ -13,9 +16,8 @@ Caveats — Google Health's data model isn't 1:1 with Apple HealthKit (which is 
   ``ActivityMetric.ACTIVE_CALORIES`` because that's the closest semantic match
   (Fitbit's caloriesOut historically lands there). ``BASAL_CALORIES`` is not
   available from the Google Health API.
-* ``healthdatamodel`` does not yet have a public ``ingest_workouts()`` helper, so
-  exercise sessions are persisted via ``Workout.objects.create`` directly. This is
-  a stopgap; when the upstream package exposes a public API, lift this over.
+* ``HKAltitudeGain`` is a non-standard identifier — Apple HealthKit doesn't have
+  a direct analog for cumulative elevation gain over an interval.
 
 The high-level orchestrator is :func:`sync_user`.
 """
@@ -26,14 +28,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from healthdatamodel.ingest import ingest_records
-from healthdatamodel.models import Workout, WorkoutMetadataEntry
+from healthdatamodel.constants import DataSource
+from healthdatamodel.ingest import ingest_records, ingest_workouts
 from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
 from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 
 from .client import GoogleHealthClient
 from .constants import (
-    DATA_SOURCE,
     DATA_TYPE_ACTIVE_ZONE_MINUTES,
     DATA_TYPE_ALTITUDE,
     DATA_TYPE_BODY_FAT,
@@ -353,50 +354,6 @@ def map_exercise(data_point: dict[str, Any]) -> WorkoutInput:
     )
 
 
-# Workout persistence ---------------------------------------------------------
-
-
-def _ingest_workouts(
-    customer: Any,
-    workouts: list[WorkoutInput],
-    *,
-    source: str = DATA_SOURCE,
-    admin_create_date: datetime | None = None,
-) -> None:
-    """Persist workouts via direct ORM writes.
-
-    Stopgap until ``healthdatamodel`` exposes a public ``ingest_workouts()``.
-    """
-    _ = admin_create_date  # auto-set on the model
-    for w in workouts:
-        workout = Workout.objects.create(
-            customer=customer,
-            startDate=w.startDate,
-            endDate=w.endDate,
-            creationDate=w.creationDate,
-            sourceVersion=w.sourceVersion,
-            sourceName=w.sourceName,
-            source=source,
-            device=w.device,
-            durationUnit=w.durationUnit,
-            duration=int(w.duration),
-            workoutActivityType=w.workoutActivityType,
-        )
-        for entry in w.metadataEntry or []:
-            WorkoutMetadataEntry.objects.create(
-                workout=workout, key=entry.key, value=entry.value
-            )
-        # caloriesBurned and distance aren't first-class columns on Workout; stash via metadata.
-        if w.caloriesBurned is not None:
-            WorkoutMetadataEntry.objects.create(
-                workout=workout, key="caloriesBurned", value=str(w.caloriesBurned)
-            )
-        if w.distance is not None:
-            WorkoutMetadataEntry.objects.create(
-                workout=workout, key="distance_km", value=str(w.distance)
-            )
-
-
 # Orchestrator ----------------------------------------------------------------
 
 
@@ -464,7 +421,9 @@ def sync_user(
 
             if data_type == DATA_TYPE_EXERCISE:
                 workouts = [map_exercise(dp) for dp in data_points]
-                _ingest_workouts(connection.customer, workouts)
+                ingest_workouts(
+                    connection.customer, workouts, source=DataSource.GOOGLE_HEALTH
+                )
                 result.counts[data_type] = len(workouts)
                 continue
 
@@ -474,7 +433,9 @@ def sync_user(
             records: list[RecordInput] = []
             for dp in data_points:
                 records.extend(mapper(dp))
-            ingest_records(connection.customer, records, source=DATA_SOURCE)
+            ingest_records(
+                connection.customer, records, source=DataSource.GOOGLE_HEALTH
+            )
             result.counts[data_type] = len(records)
     finally:
         if owns_client:

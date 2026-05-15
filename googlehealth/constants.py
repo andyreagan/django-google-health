@@ -58,7 +58,6 @@ DATA_TYPE_WEIGHT = "weight"
 DATA_TYPE_DAILY_RESTING_HEART_RATE = "daily-resting-heart-rate"
 DATA_TYPE_DAILY_OXYGEN_SATURATION = "daily-oxygen-saturation"
 
-# Identifier used when persisting records through django-healthdatamodel.
-# Underscore form matches upstream DataSource members (apple_health, health_connect).
-DATA_SOURCE = "google_health"
-SOURCE_NAME = "Google Health"  # human-readable, stored in Record.sourceName
+# Human-readable, stored in Record.sourceName. The machine identifier is
+# ``healthdatamodel.constants.DataSource.GOOGLE_HEALTH`` (added in 0.4.0).
+SOURCE_NAME = "Google Health"

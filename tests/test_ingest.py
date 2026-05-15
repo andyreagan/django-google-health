@@ -14,10 +14,11 @@ from httpx import Response
 
 from googlehealth import ingest, oauth
 from googlehealth.client import GoogleHealthClient
+from healthdatamodel.constants import DataSource
+
 from googlehealth.constants import (
     API_BASE_URL,
     API_VERSION,
-    DATA_SOURCE,
     DATA_TYPE_EXERCISE,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_SLEEP,
@@ -478,10 +479,11 @@ def test_sync_user_persists_each_data_type(connection, customer):
     # Records landed in healthdatamodel
     records = Record.objects.filter(customer=customer)
     assert records.count() == 6  # 4 samples + 2 sleep stage records
-    assert {r.source for r in records} == {DATA_SOURCE}
+    assert {r.source for r in records} == {DataSource.GOOGLE_HEALTH}
     assert {r.sourceName for r in records} == {SOURCE_NAME}
 
-    # Workout landed via ORM stopgap, with calories + distance in metadata
+    # Workout landed via healthdatamodel.ingest_workouts (calories + distance
+    # → metadata entries upstream).
     workout = Workout.objects.get(customer=customer)
     assert workout.workoutActivityType == "RUNNING"
     assert workout.duration == 1800
@@ -490,7 +492,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
             "key", flat=True
         )
     )
-    assert {"caloriesBurned", "distance_km"} <= metadata_keys
+    assert {"caloriesBurned", "distance"} <= metadata_keys
 
     # Connection got a sync timestamp
     connection.refresh_from_db()
