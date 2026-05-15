@@ -34,7 +34,14 @@ from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 from .client import GoogleHealthClient
 from .constants import (
     DATA_SOURCE,
+    DATA_TYPE_ACTIVE_ZONE_MINUTES,
+    DATA_TYPE_ALTITUDE,
+    DATA_TYPE_BODY_FAT,
+    DATA_TYPE_DAILY_OXYGEN_SATURATION,
+    DATA_TYPE_DAILY_RESTING_HEART_RATE,
+    DATA_TYPE_DISTANCE,
     DATA_TYPE_EXERCISE,
+    DATA_TYPE_FLOORS,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_SLEEP,
     DATA_TYPE_STEPS,
@@ -49,6 +56,15 @@ if TYPE_CHECKING:
 # Apple HealthKit identifiers not exported as enum members in healthdatamodel.
 HK_HEART_RATE = "HKQuantityTypeIdentifierHeartRate"
 HK_BODY_MASS = "HKQuantityTypeIdentifierBodyMass"
+HK_DISTANCE_WALKING_RUNNING = "HKQuantityTypeIdentifierDistanceWalkingRunning"
+HK_FLIGHTS_CLIMBED = "HKQuantityTypeIdentifierFlightsClimbed"
+HK_ALTITUDE_GAIN = (
+    "HKQuantityTypeIdentifierAltitudeGain"  # non-standard; closest mirror
+)
+HK_ACTIVE_ZONE_MINUTES = "HKQuantityTypeIdentifierAppleExerciseTime"
+HK_RESTING_HEART_RATE = "HKQuantityTypeIdentifierRestingHeartRate"
+HK_OXYGEN_SATURATION = "HKQuantityTypeIdentifierOxygenSaturation"
+HK_BODY_FAT_PERCENTAGE = "HKQuantityTypeIdentifierBodyFatPercentage"
 
 # Map Google's sleep stage strings → healthdatamodel SleepValue.
 _SLEEP_STAGE_MAP: dict[str, str] = {
@@ -164,6 +180,112 @@ def map_weight(data_point: dict[str, Any]) -> RecordInput:
         type=HK_BODY_MASS,
         value=str(block.get("weightKg", "0")),
         unit="kg",
+    )
+
+
+def map_distance(data_point: dict[str, Any]) -> RecordInput:
+    """Distance accumulated over an Interval. Google reports millimeters."""
+    block = data_point["distance"]
+    start, end = _interval_bounds(block)
+    distance_mm = float(
+        block.get("distanceMillimeters") or block.get("distanceMillimiters") or 0
+    )
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=HK_DISTANCE_WALKING_RUNNING,
+        value=str(distance_mm / 1000.0),
+        unit="m",
+    )
+
+
+def map_altitude(data_point: dict[str, Any]) -> RecordInput:
+    """Elevation gained over an Interval. Google reports millimeters."""
+    block = data_point["altitude"]
+    start, end = _interval_bounds(block)
+    altitude_mm = float(
+        block.get("elevationGainMillimeters")
+        or block.get("elevationGainMillimiters")
+        or 0
+    )
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=HK_ALTITUDE_GAIN,
+        value=str(altitude_mm / 1000.0),
+        unit="m",
+    )
+
+
+def map_floors(data_point: dict[str, Any]) -> RecordInput:
+    """Floors climbed over an Interval."""
+    block = data_point["floors"]
+    start, end = _interval_bounds(block)
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=HK_FLIGHTS_CLIMBED,
+        value=str(block.get("floorsClimbed", "0")),
+        unit="count",
+    )
+
+
+def map_active_zone_minutes(data_point: dict[str, Any]) -> RecordInput:
+    """Active-zone minutes over an Interval."""
+    block = data_point["activeZoneMinutes"]
+    start, end = _interval_bounds(block)
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=HK_ACTIVE_ZONE_MINUTES,
+        value=str(block.get("minutes", "0")),
+        unit="min",
+    )
+
+
+def map_daily_resting_heart_rate(data_point: dict[str, Any]) -> RecordInput:
+    """One daily-aggregate resting heart rate."""
+    block = data_point["dailyRestingHeartRate"]
+    start, end = _interval_bounds(block)
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=HK_RESTING_HEART_RATE,
+        value=str(block.get("beatsPerMinute", "0")),
+        unit="count/min",
+    )
+
+
+def map_daily_oxygen_saturation(data_point: dict[str, Any]) -> RecordInput:
+    """Daily-aggregate SpO2 average (percentage)."""
+    block = data_point["dailyOxygenSaturation"]
+    start, end = _interval_bounds(block)
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=start,
+        endDate=end,
+        type=HK_OXYGEN_SATURATION,
+        value=str(block.get("averagePercentage") or block.get("percentage") or "0"),
+        unit="%",
+    )
+
+
+def map_body_fat(data_point: dict[str, Any]) -> RecordInput:
+    """Body-fat percentage Sample (point in time)."""
+    block = data_point["bodyFat"]
+    instant = _parse_dt(block.get("time"))
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=instant,
+        endDate=instant,
+        type=HK_BODY_FAT_PERCENTAGE,
+        value=str(block.get("percentage", "0")),
+        unit="%",
     )
 
 
@@ -284,6 +406,13 @@ _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
     DATA_TYPE_HEART_RATE: lambda dp: [map_heart_rate(dp)],
     DATA_TYPE_WEIGHT: lambda dp: [map_weight(dp)],
     DATA_TYPE_SLEEP: map_sleep_session,
+    DATA_TYPE_DISTANCE: lambda dp: [map_distance(dp)],
+    DATA_TYPE_ALTITUDE: lambda dp: [map_altitude(dp)],
+    DATA_TYPE_FLOORS: lambda dp: [map_floors(dp)],
+    DATA_TYPE_ACTIVE_ZONE_MINUTES: lambda dp: [map_active_zone_minutes(dp)],
+    DATA_TYPE_DAILY_RESTING_HEART_RATE: lambda dp: [map_daily_resting_heart_rate(dp)],
+    DATA_TYPE_DAILY_OXYGEN_SATURATION: lambda dp: [map_daily_oxygen_saturation(dp)],
+    DATA_TYPE_BODY_FAT: lambda dp: [map_body_fat(dp)],
 }
 
 DEFAULT_DATA_TYPES: tuple[str, ...] = (
@@ -293,6 +422,13 @@ DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_WEIGHT,
     DATA_TYPE_SLEEP,
     DATA_TYPE_EXERCISE,
+    DATA_TYPE_DISTANCE,
+    DATA_TYPE_ALTITUDE,
+    DATA_TYPE_FLOORS,
+    DATA_TYPE_ACTIVE_ZONE_MINUTES,
+    DATA_TYPE_DAILY_RESTING_HEART_RATE,
+    DATA_TYPE_DAILY_OXYGEN_SATURATION,
+    DATA_TYPE_BODY_FAT,
 )
 
 

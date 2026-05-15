@@ -167,6 +167,160 @@ def test_map_sleep_session_decomposes_stages():
     assert all(r.type == SLEEP_TYPE for r in records)
 
 
+def test_map_distance():
+    dp = {
+        "name": "users/x/dataTypes/distance/dataPoints/d1",
+        "distance": {
+            "interval": {
+                "startTime": "2026-05-01T10:00:00Z",
+                "endTime": "2026-05-01T10:15:00Z",
+            },
+            "distanceMillimeters": 1_609_344,  # 1 mile
+            "updateTime": "2026-05-01T10:16:00Z",
+        },
+    }
+    rec = ingest.map_distance(dp)
+    assert rec.type == ingest.HK_DISTANCE_WALKING_RUNNING
+    assert float(rec.value) == pytest.approx(1609.344)
+    assert rec.unit == "m"
+
+
+def test_map_altitude():
+    dp = {
+        "name": "users/x/dataTypes/altitude/dataPoints/a1",
+        "altitude": {
+            "interval": {
+                "startTime": "2026-05-01T10:00:00Z",
+                "endTime": "2026-05-01T10:30:00Z",
+            },
+            "elevationGainMillimeters": 12_500,  # 12.5 m
+            "updateTime": "2026-05-01T10:31:00Z",
+        },
+    }
+    rec = ingest.map_altitude(dp)
+    assert rec.type == ingest.HK_ALTITUDE_GAIN
+    assert float(rec.value) == pytest.approx(12.5)
+    assert rec.unit == "m"
+
+
+def test_map_floors():
+    dp = {
+        "name": "users/x/dataTypes/floors/dataPoints/f1",
+        "floors": {
+            "interval": {
+                "startTime": "2026-05-01T08:00:00Z",
+                "endTime": "2026-05-01T08:15:00Z",
+            },
+            "floorsClimbed": 3,
+            "updateTime": "2026-05-01T08:16:00Z",
+        },
+    }
+    rec = ingest.map_floors(dp)
+    assert rec.type == ingest.HK_FLIGHTS_CLIMBED
+    assert rec.value == "3"
+    assert rec.unit == "count"
+
+
+def test_map_active_zone_minutes():
+    dp = {
+        "name": "users/x/dataTypes/active-zone-minutes/dataPoints/azm1",
+        "activeZoneMinutes": {
+            "interval": {
+                "startTime": "2026-05-01T07:00:00Z",
+                "endTime": "2026-05-01T08:00:00Z",
+            },
+            "minutes": 22,
+            "updateTime": "2026-05-01T08:01:00Z",
+        },
+    }
+    rec = ingest.map_active_zone_minutes(dp)
+    assert rec.type == ingest.HK_ACTIVE_ZONE_MINUTES
+    assert rec.value == "22"
+    assert rec.unit == "min"
+
+
+def test_map_daily_resting_heart_rate():
+    dp = {
+        "name": "users/x/dataTypes/daily-resting-heart-rate/dataPoints/drhr1",
+        "dailyRestingHeartRate": {
+            "interval": {
+                "startTime": "2026-05-01T00:00:00Z",
+                "endTime": "2026-05-02T00:00:00Z",
+            },
+            "beatsPerMinute": 58,
+            "updateTime": "2026-05-02T00:01:00Z",
+        },
+    }
+    rec = ingest.map_daily_resting_heart_rate(dp)
+    assert rec.type == ingest.HK_RESTING_HEART_RATE
+    assert rec.value == "58"
+
+
+def test_map_daily_oxygen_saturation():
+    dp = {
+        "name": "users/x/dataTypes/daily-oxygen-saturation/dataPoints/dox1",
+        "dailyOxygenSaturation": {
+            "interval": {
+                "startTime": "2026-05-01T00:00:00Z",
+                "endTime": "2026-05-02T00:00:00Z",
+            },
+            "averagePercentage": 96.5,
+            "updateTime": "2026-05-02T00:01:00Z",
+        },
+    }
+    rec = ingest.map_daily_oxygen_saturation(dp)
+    assert rec.type == ingest.HK_OXYGEN_SATURATION
+    assert rec.value == "96.5"
+    assert rec.unit == "%"
+
+
+def test_map_body_fat():
+    dp = {
+        "name": "users/x/dataTypes/body-fat/dataPoints/bf1",
+        "bodyFat": {
+            "time": "2026-05-01T08:00:00Z",
+            "percentage": 18.2,
+            "updateTime": "2026-05-01T08:00:01Z",
+        },
+    }
+    rec = ingest.map_body_fat(dp)
+    assert rec.type == ingest.HK_BODY_FAT_PERCENTAGE
+    assert rec.value == "18.2"
+    assert rec.startDate == rec.endDate
+
+
+def test_default_data_types_includes_all_mapped_types():
+    """Ensure the default sweep covers every mapper we expose."""
+    assert set(ingest.DEFAULT_DATA_TYPES) >= {
+        DATA_TYPE_STEPS,
+        DATA_TYPE_TOTAL_CALORIES,
+        DATA_TYPE_HEART_RATE,
+        DATA_TYPE_WEIGHT,
+        DATA_TYPE_SLEEP,
+        DATA_TYPE_EXERCISE,
+    }
+    # And the new ones from slice 7.
+    from googlehealth.constants import (
+        DATA_TYPE_ACTIVE_ZONE_MINUTES,
+        DATA_TYPE_ALTITUDE,
+        DATA_TYPE_BODY_FAT,
+        DATA_TYPE_DAILY_OXYGEN_SATURATION,
+        DATA_TYPE_DAILY_RESTING_HEART_RATE,
+        DATA_TYPE_DISTANCE,
+        DATA_TYPE_FLOORS,
+    )
+
+    assert {
+        DATA_TYPE_DISTANCE,
+        DATA_TYPE_ALTITUDE,
+        DATA_TYPE_FLOORS,
+        DATA_TYPE_ACTIVE_ZONE_MINUTES,
+        DATA_TYPE_DAILY_RESTING_HEART_RATE,
+        DATA_TYPE_DAILY_OXYGEN_SATURATION,
+        DATA_TYPE_BODY_FAT,
+    } <= set(ingest.DEFAULT_DATA_TYPES)
+
+
 def test_map_exercise():
     dp = {
         "name": "users/x/dataTypes/exercise/dataPoints/e1",
@@ -298,7 +452,19 @@ def test_sync_user_persists_each_data_type(connection, customer):
     start = datetime(2026, 5, 1, tzinfo=timezone.utc)
     end = datetime(2026, 5, 2, tzinfo=timezone.utc)
 
-    result = ingest.sync_user(connection, start=start, end=end)
+    result = ingest.sync_user(
+        connection,
+        start=start,
+        end=end,
+        data_types=[
+            DATA_TYPE_STEPS,
+            DATA_TYPE_TOTAL_CALORIES,
+            DATA_TYPE_HEART_RATE,
+            DATA_TYPE_WEIGHT,
+            DATA_TYPE_SLEEP,
+            DATA_TYPE_EXERCISE,
+        ],
+    )
 
     # Per-type counts
     assert result.counts[DATA_TYPE_STEPS] == 1
