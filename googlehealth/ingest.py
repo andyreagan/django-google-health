@@ -120,17 +120,44 @@ def _interval_bounds(value: dict[str, Any]) -> tuple[datetime, datetime]:
 def _common_record_fields(data_point: dict[str, Any]) -> dict[str, Any]:
     return {
         "recordId": _record_id(data_point),
-        "creationDate": _parse_dt(_update_time(data_point)),
+        "creationDate": _creation_date(data_point),
         "sourceName": SOURCE_NAME,
     }
 
 
-def _update_time(data_point: dict[str, Any]) -> str | None:
-    # The update_time lives nested under the type block, e.g. data_point["exercise"]["updateTime"].
+def _creation_date(data_point: dict[str, Any]) -> datetime:
+    """Pick the best available timestamp for ``Record.creationDate``.
+
+    Google's list response often omits ``updateTime`` — only get-by-id calls
+    include it. Fall back to the interval start / sampleTime, then to ``now()``.
+    """
     for block in data_point.values():
-        if isinstance(block, dict) and "updateTime" in block:
-            return block["updateTime"]
-    return None
+        if not isinstance(block, dict):
+            continue
+        if "updateTime" in block:
+            return _parse_dt(block["updateTime"])
+        interval = block.get("interval")
+        if isinstance(interval, dict) and "startTime" in interval:
+            return _parse_dt(interval["startTime"])
+        sample = block.get("sampleTime")
+        if isinstance(sample, dict) and "physicalTime" in sample:
+            return _parse_dt(sample["physicalTime"])
+    return datetime.now(timezone.utc)
+
+
+def _sample_instant(block: dict[str, Any]) -> datetime:
+    """Resolve the point-in-time for a Sample data type.
+
+    Production payload: ``{"sampleTime": {"physicalTime": "...Z", ...}}``.
+    Earlier drafts of this code expected a flat ``"time"`` field; we accept
+    either for resilience.
+    """
+    sample_time = block.get("sampleTime")
+    if isinstance(sample_time, dict) and sample_time.get("physicalTime"):
+        return _parse_dt(sample_time["physicalTime"])
+    if block.get("time"):
+        return _parse_dt(block["time"])
+    raise ValueError("Sample data point has no sampleTime.physicalTime or time field")
 
 
 # Mappers ---------------------------------------------------------------------
@@ -139,12 +166,14 @@ def _update_time(data_point: dict[str, Any]) -> str | None:
 def map_steps(data_point: dict[str, Any]) -> RecordInput:
     block = data_point["steps"]
     start, end = _interval_bounds(block)
+    # Live payload uses "count"; earlier drafts assumed "stepCount" — accept both.
+    count = block.get("count") or block.get("stepCount") or "0"
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=start,
         endDate=end,
         type=str(ActivityMetric.STEPS),
-        value=str(block.get("stepCount", "0")),
+        value=str(count),
         unit="count",
     )
 
@@ -164,8 +193,7 @@ def map_total_calories(data_point: dict[str, Any]) -> RecordInput:
 
 def map_heart_rate(data_point: dict[str, Any]) -> RecordInput:
     block = data_point["heartRate"]
-    # Heart-rate is a Sample (point-in-time). Use the same instant for start and end.
-    instant = _parse_dt(block.get("time"))
+    instant = _sample_instant(block)
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
@@ -178,13 +206,18 @@ def map_heart_rate(data_point: dict[str, Any]) -> RecordInput:
 
 def map_weight(data_point: dict[str, Any]) -> RecordInput:
     block = data_point["weight"]
-    instant = _parse_dt(block.get("time"))
+    instant = _sample_instant(block)
+    # Live payload uses weightGrams (integer); accept weightKg for back-compat.
+    if "weightGrams" in block:
+        weight_kg = float(block["weightGrams"]) / 1000.0
+    else:
+        weight_kg = float(block.get("weightKg", 0))
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
         endDate=instant,
         type=HK_BODY_MASS,
-        value=str(block.get("weightKg", "0")),
+        value=str(weight_kg),
         unit="kg",
     )
 
@@ -284,7 +317,7 @@ def map_daily_oxygen_saturation(data_point: dict[str, Any]) -> RecordInput:
 def map_body_fat(data_point: dict[str, Any]) -> RecordInput:
     """Body-fat percentage Sample (point in time)."""
     block = data_point["bodyFat"]
-    instant = _parse_dt(block.get("time"))
+    instant = _sample_instant(block)
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
@@ -296,10 +329,14 @@ def map_body_fat(data_point: dict[str, Any]) -> RecordInput:
 
 
 def map_height(data_point: dict[str, Any]) -> RecordInput:
-    """Height Sample (point in time). Google reports meters."""
+    """Height Sample (point in time). Live payload reports millimeters."""
     block = data_point["height"]
-    instant = _parse_dt(block.get("time"))
-    height_m = float(block.get("heightMeters") or block.get("heightM") or 0)
+    instant = _sample_instant(block)
+    # Live payload: heightMillimeters as string. Older drafts assumed heightMeters/heightM.
+    if "heightMillimeters" in block:
+        height_m = float(block["heightMillimeters"]) / 1000.0
+    else:
+        height_m = float(block.get("heightMeters") or block.get("heightM") or 0)
     return RecordInput(
         **_common_record_fields(data_point),
         startDate=instant,
@@ -393,9 +430,17 @@ _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
     DATA_TYPE_HEIGHT: lambda dp: [map_height(dp)],
 }
 
+# Excluded from DEFAULT_DATA_TYPES because Google rejects ``list`` for them
+# ("List is not supported for data type X, but the following actions are
+# supported: import, rollup, dailyRollup, reconcile"). Fetching these requires a
+# separate dailyRollUp-based ingest path that we haven't built yet.
+ROLLUP_ONLY_DATA_TYPES: tuple[str, ...] = (
+    DATA_TYPE_TOTAL_CALORIES,
+    DATA_TYPE_FLOORS,
+)
+
 DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_STEPS,
-    DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_WEIGHT,
     DATA_TYPE_HEIGHT,
@@ -403,7 +448,6 @@ DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_EXERCISE,
     DATA_TYPE_DISTANCE,
     DATA_TYPE_ALTITUDE,
-    DATA_TYPE_FLOORS,
     DATA_TYPE_ACTIVE_ZONE_MINUTES,
     DATA_TYPE_DAILY_RESTING_HEART_RATE,
     DATA_TYPE_DAILY_OXYGEN_SATURATION,
@@ -422,16 +466,23 @@ def _civil(ts: datetime) -> str:
     )
 
 
-# Data types whose payload is a point-in-time Sample (no ``interval`` block).
-# These don't support the ``<type>.interval.civil_*`` filter — we either filter
-# on the ``time`` field or fetch unfiltered and let the API's recency ordering
-# bound the result.
-_SAMPLE_DATA_TYPES = frozenset(
+# Data types we fetch unfiltered — server rejects every filter syntax we've
+# tried. Empirically confirmed against a live account on 2026-05-15:
+#   * Sample types (heart-rate, weight, height, body-fat): no documented
+#     filter field; payload uses ``sampleTime``, not ``interval``.
+#   * Sleep (Session): filters on ``interval.civil_start_time`` / ``start_time``
+#     / ``civil_start_time`` all returned INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER.
+#   * Daily aggregates (daily-resting-heart-rate, daily-oxygen-saturation): same.
+# Pagination + recency ordering bound the result for these.
+_UNFILTERABLE_DATA_TYPES = frozenset(
     {
         DATA_TYPE_HEART_RATE,
         DATA_TYPE_WEIGHT,
         DATA_TYPE_BODY_FAT,
         DATA_TYPE_HEIGHT,
+        DATA_TYPE_SLEEP,
+        DATA_TYPE_DAILY_RESTING_HEART_RATE,
+        DATA_TYPE_DAILY_OXYGEN_SATURATION,
     }
 )
 
@@ -440,18 +491,19 @@ def _build_filter(data_type: str, start: datetime, end: datetime) -> str | None:
     """Return the ``filter`` query-string value for a given data type, or ``None``
     to fetch unfiltered.
 
-    Interval/Session/Daily types: ``<key>.interval.civil_start_time`` /
-    ``civil_end_time`` (per the codelab).  Sample types: no filter — Google's
-    REST docs don't specify the filter field for samples, so we fetch and rely
-    on pagination + recency ordering.
+    Interval/Session/Daily types: one-sided ``<key>.interval.civil_start_time >=``
+    bound. Google's filter language rejects ``civil_end_time``/``end_time`` as
+    filterable fields (verified empirically against ``steps`` — combined AND
+    queries return ``INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER``). Upper bound
+    is enforced client-side in ``sync_user``.
+
+    Sample types: no filter — REST docs don't specify a filter field for
+    samples, so we fetch and rely on pagination + recency ordering.
     """
-    if data_type in _SAMPLE_DATA_TYPES:
+    if data_type in _UNFILTERABLE_DATA_TYPES:
         return None
     key = data_type.replace("-", "_")
-    return (
-        f'{key}.interval.civil_start_time >= "{_civil(start)}" '
-        f'AND {key}.interval.civil_end_time <= "{_civil(end)}"'
-    )
+    return f'{key}.interval.civil_start_time >= "{_civil(start)}"'
 
 
 # Basal calories --------------------------------------------------------------

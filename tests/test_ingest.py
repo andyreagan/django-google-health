@@ -310,12 +310,16 @@ def test_default_data_types_includes_all_mapped_types():
     """Ensure the default sweep covers every mapper we expose."""
     assert set(ingest.DEFAULT_DATA_TYPES) >= {
         DATA_TYPE_STEPS,
-        DATA_TYPE_TOTAL_CALORIES,
         DATA_TYPE_HEART_RATE,
         DATA_TYPE_WEIGHT,
         DATA_TYPE_SLEEP,
         DATA_TYPE_EXERCISE,
     }
+    # total-calories and floors are excluded from DEFAULT_DATA_TYPES because
+    # Google rejects `list` for them — they need a dailyRollUp path we haven't
+    # built yet. They're still mapped (the mapper functions exist) so the
+    # consumer can wire them in once that path lands.
+    assert DATA_TYPE_TOTAL_CALORIES in ingest.ROLLUP_ONLY_DATA_TYPES
     # And the new ones from slice 7.
     from googlehealth.constants import (
         DATA_TYPE_ACTIVE_ZONE_MINUTES,
@@ -330,12 +334,12 @@ def test_default_data_types_includes_all_mapped_types():
     assert {
         DATA_TYPE_DISTANCE,
         DATA_TYPE_ALTITUDE,
-        DATA_TYPE_FLOORS,
         DATA_TYPE_ACTIVE_ZONE_MINUTES,
         DATA_TYPE_DAILY_RESTING_HEART_RATE,
         DATA_TYPE_DAILY_OXYGEN_SATURATION,
         DATA_TYPE_BODY_FAT,
     } <= set(ingest.DEFAULT_DATA_TYPES)
+    assert DATA_TYPE_FLOORS in ingest.ROLLUP_ONLY_DATA_TYPES
 
 
 def test_map_exercise():
