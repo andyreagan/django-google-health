@@ -411,10 +411,46 @@ DEFAULT_DATA_TYPES: tuple[str, ...] = (
 )
 
 
-def _interval_filter(google_filter_key: str, start: datetime, end: datetime) -> str:
+def _civil(ts: datetime) -> str:
+    """Format ``ts`` as the civil-time string Google's filter language expects.
+
+    No timezone, no microseconds — matches the codelab pattern
+    ``"2026-02-22T00:00:00"``.
+    """
     return (
-        f'{google_filter_key}.interval.start_time >= "{start.isoformat()}" '
-        f'AND {google_filter_key}.interval.end_time <= "{end.isoformat()}"'
+        ts.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+    )
+
+
+# Data types whose payload is a point-in-time Sample (no ``interval`` block).
+# These don't support the ``<type>.interval.civil_*`` filter — we either filter
+# on the ``time`` field or fetch unfiltered and let the API's recency ordering
+# bound the result.
+_SAMPLE_DATA_TYPES = frozenset(
+    {
+        DATA_TYPE_HEART_RATE,
+        DATA_TYPE_WEIGHT,
+        DATA_TYPE_BODY_FAT,
+        DATA_TYPE_HEIGHT,
+    }
+)
+
+
+def _build_filter(data_type: str, start: datetime, end: datetime) -> str | None:
+    """Return the ``filter`` query-string value for a given data type, or ``None``
+    to fetch unfiltered.
+
+    Interval/Session/Daily types: ``<key>.interval.civil_start_time`` /
+    ``civil_end_time`` (per the codelab).  Sample types: no filter — Google's
+    REST docs don't specify the filter field for samples, so we fetch and rely
+    on pagination + recency ordering.
+    """
+    if data_type in _SAMPLE_DATA_TYPES:
+        return None
+    key = data_type.replace("-", "_")
+    return (
+        f'{key}.interval.civil_start_time >= "{_civil(start)}" '
+        f'AND {key}.interval.civil_end_time <= "{_civil(end)}"'
     )
 
 
@@ -571,8 +607,7 @@ def sync_user(
 
     try:
         for data_type in data_types or DEFAULT_DATA_TYPES:
-            filter_key = data_type.replace("-", "_")
-            filter_expr = _interval_filter(filter_key, start, end)
+            filter_expr = _build_filter(data_type, start, end)
             data_points = list(client.iter_data_points(data_type, filter=filter_expr))
 
             if data_type == DATA_TYPE_EXERCISE:
