@@ -104,36 +104,22 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 uv run python manage.py runserver
 ```
 
-### 3. Connect
+### 3. Connect + sync from the browser
 
-1. Open <http://localhost:8000/admin/> and log in with the superuser you just
-   created.
-2. In the same browser session, visit
-   <http://localhost:8000/google-health/connect/>. You'll be redirected to
-   Google's consent screen. Approve, and Google redirects back to
-   `/google-health/callback/` which writes a `GoogleHealthConnection` for your
-   user.
+Open <http://localhost:8000/>. You'll be redirected to a sign-in page; use the
+superuser you just created. The demo homepage gives you:
 
-### 4. Sync data
+- A **Connect Google Health** button → kicks off OAuth, returns here.
+- Once connected, a **Sync now** form with a "days" input → fetches the
+  selected window and persists everything into `healthdatamodel`.
+- A running count of records + workouts and a link to the admin to browse them.
+- A **Disconnect** button.
 
-Back in the terminal:
+If you'd rather drive sync from the terminal (handy for backfills or cron):
 
 ```
 uv run python manage.py sync_google_health --user <your-username> --days 7
 ```
-
-The command prints a per-data-type record count. Open
-<http://localhost:8000/admin/healthdatamodel/record/> to browse what landed.
-Workouts are under
-<http://localhost:8000/admin/healthdatamodel/workout/>.
-
-### 5. Disconnect (optional)
-
-```
-curl -X POST http://localhost:8000/google-health/disconnect/ -b "<session cookie>"
-```
-
-…or just delete the `GoogleHealthConnection` from the admin.
 
 ## Development
 

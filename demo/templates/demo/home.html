@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>django-google-health demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+    h1 { font-size: 1.5rem; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 1rem 0; padding: 1rem; border: 1px solid #ddd; border-radius: 6px; }
+    .row.connected { border-color: #2a7; background: #f4fbf6; }
+    .row.disconnected { border-color: #c84; background: #fff8f0; }
+    button, a.button { display: inline-block; padding: 0.5rem 1rem; border: 1px solid #333; background: #333; color: white; text-decoration: none; border-radius: 4px; cursor: pointer; }
+    .messages { padding: 0; list-style: none; }
+    .messages li { padding: 0.75rem 1rem; border-radius: 4px; margin-bottom: 0.5rem; }
+    .messages li.success { background: #e9f7ed; }
+    .messages li.error { background: #fdecea; }
+    nav { font-size: 0.875rem; color: #555; }
+    nav a { color: #555; }
+    code { background: #f3f3f3; padding: 0.1rem 0.3rem; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <nav>
+    Signed in as <strong>{{ request.user.username }}</strong> ·
+    <a href="/admin/">admin</a> ·
+    <form action="{% url 'logout' %}" method="post" style="display:inline">{% csrf_token %}<button style="background:none;border:none;color:#555;padding:0;cursor:pointer;text-decoration:underline">sign out</button></form>
+  </nav>
+
+  <h1>django-google-health demo</h1>
+
+  {% if messages %}
+    <ul class="messages">
+      {% for message in messages %}<li class="{{ message.tags }}">{{ message }}</li>{% endfor %}
+    </ul>
+  {% endif %}
+
+  {% if connection %}
+    <div class="row connected">
+      <div>
+        <strong>Google Health connected</strong><br />
+        <small>
+          Google user ID: <code>{{ connection.google_user_id }}</code><br />
+          Status: {{ connection.status }} ·
+          Last sync: {{ connection.last_sync_at|default:"never" }}
+        </small>
+      </div>
+      <form action="{% url 'demo-sync' %}" method="post">
+        {% csrf_token %}
+        <label>days <input type="number" name="days" value="7" min="1" max="90" style="width:4rem" /></label>
+        <button type="submit">Sync now</button>
+      </form>
+    </div>
+    <div class="row">
+      <div>
+        <strong>{{ record_count }}</strong> record(s) ·
+        <strong>{{ workout_count }}</strong> workout(s) in healthdatamodel
+      </div>
+      <a class="button" href="/admin/healthdatamodel/record/">Browse records</a>
+    </div>
+    <form action="{% url 'googlehealth:disconnect' %}" method="post" style="margin-top:1rem">
+      {% csrf_token %}
+      <button type="submit" style="background:#fff;color:#a00;border-color:#a00">Disconnect</button>
+    </form>
+  {% else %}
+    <div class="row disconnected">
+      <div>
+        <strong>Not connected to Google Health.</strong><br />
+        <small>You'll be sent to Google for consent, then back here.</small>
+      </div>
+      <a class="button" href="{% url 'googlehealth:connect' %}">Connect Google Health</a>
+    </div>
+  {% endif %}
+</body>
+</html>
