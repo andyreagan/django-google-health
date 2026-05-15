@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, datetime, timedelta, timezone
 
@@ -711,6 +712,142 @@ def test_sync_user_with_compute_basal_calls_profile_and_persists(connection):
         ).count()
         == 2
     )
+
+
+def _rollup_url(data_type: str) -> str:
+    return (
+        f"{API_BASE_URL}/{API_VERSION}/users/me/dataTypes/{data_type}/dataPoints:rollUp"
+    )
+
+
+@respx.mock
+def test_sync_user_with_resolution_uses_rollup_endpoint(connection):
+    """resolution_minutes=15 → rollUp path; mappers translate the
+    type-specific value fields into Records of the right HK type + unit."""
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    customer = connection.customer
+    steps_route = respx.post(_rollup_url(DATA_TYPE_STEPS)).mock(
+        return_value=Response(
+            200,
+            json={
+                "rollupDataPoints": [
+                    {
+                        "startTime": "2026-05-01T00:00:00Z",
+                        "endTime": "2026-05-01T00:15:00Z",
+                        "steps": {"countSum": "120"},
+                    },
+                    {
+                        "startTime": "2026-05-01T00:15:00Z",
+                        "endTime": "2026-05-01T00:30:00Z",
+                        "steps": {"countSum": "240"},
+                    },
+                ],
+                "nextPageToken": "",
+            },
+        )
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS],
+        resolution_minutes=15,
+        compute_basal=False,
+    )
+
+    # rollUp endpoint was used (not list)
+    body = json.loads(steps_route.calls.last.request.content)
+    assert body["windowSize"] == "900s"
+    assert body["range"]["startTime"].endswith("Z")
+
+    # Two rollup windows → two Records
+    assert result.counts[DATA_TYPE_STEPS] == 2
+    records = Record.objects.filter(customer=customer, type=str(ActivityMetric.STEPS))
+    assert records.count() == 2
+    assert {r.value for r in records} == {"120", "240"}
+
+
+@respx.mock
+def test_sync_user_with_resolution_falls_back_to_list_for_unsupported_types(connection):
+    """Sleep / exercise / height / daily-* don't support rollUp — when a
+    resolution is set, those types should silently fall back to the native list."""
+    respx.get(_dp_url(DATA_TYPE_SLEEP)).mock(return_value=Response(200, json=_page([])))
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_SLEEP],
+        resolution_minutes=15,
+        compute_basal=False,
+    )
+
+    assert result.counts[DATA_TYPE_SLEEP] == 0
+
+
+@respx.mock
+def test_sync_user_resolution_expands_to_rollup_only_types(connection):
+    """When data_types is None + resolution_minutes is set, total-calories +
+    floors join the default sweep (the list endpoint rejects them)."""
+
+    # Mock every data type's rollup endpoint as empty; only assert that
+    # total-calories was queried at all.
+    for dt in ingest.DEFAULT_DATA_TYPES:
+        if dt in ingest._ROLLUP_UNSUPPORTED_DATA_TYPES:
+            respx.get(_dp_url(dt)).mock(return_value=Response(200, json=_page([])))
+        else:
+            respx.post(_rollup_url(dt)).mock(
+                return_value=Response(200, json={"rollupDataPoints": []})
+            )
+    for dt in ingest.ROLLUP_ONLY_DATA_TYPES:
+        respx.post(_rollup_url(dt)).mock(
+            return_value=Response(
+                200,
+                json={
+                    "rollupDataPoints": [
+                        {
+                            "startTime": "2026-05-01T00:00:00Z",
+                            "endTime": "2026-05-02T00:00:00Z",
+                            "totalCalories": {"kcalSum": 2200.5},
+                            "floors": {"countSum": "12"},
+                        }
+                    ],
+                    "nextPageToken": "",
+                },
+            )
+        )
+    # Sleep uses list (it's unsupported for rollup)
+    respx.get(_dp_url(DATA_TYPE_SLEEP)).mock(return_value=Response(200, json=_page([])))
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        resolution_minutes=1440,
+        compute_basal=False,
+    )
+
+    assert "total-calories" in result.counts
+    assert "floors" in result.counts
+    # Each ROLLUP_ONLY type fetch returned one rollup point with both blocks
+    # populated — the relevant mapper produced one Record.
+    assert result.counts["total-calories"] == 1
+    assert result.counts["floors"] == 1
+
+
+def test_sync_user_rejects_negative_resolution(connection):
+    with pytest.raises(ValueError, match="resolution_minutes"):
+        ingest.sync_user(
+            connection,
+            start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+            data_types=[DATA_TYPE_STEPS],
+            resolution_minutes=0,
+            compute_basal=False,
+        )
 
 
 @pytest.mark.live

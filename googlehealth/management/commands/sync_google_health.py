@@ -23,7 +23,7 @@ from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
 from django.utils.dateparse import parse_datetime
 
-from ...ingest import DEFAULT_DATA_TYPES, sync_user
+from ...ingest import sync_user
 from ...models import ConnectionStatus, GoogleHealthConnection
 
 log = logging.getLogger(__name__)
@@ -82,6 +82,16 @@ class Command(BaseCommand):
             default=True,
             help="Skip computing/persisting per-day basal calories (Mifflin-St Jeor).",
         )
+        parser.add_argument(
+            "--resolution",
+            dest="resolution_minutes",
+            type=int,
+            default=None,
+            help=(
+                "Aggregate via rollUp at this resolution in minutes (e.g. 15 or "
+                "1440). Default: fetch native granularity via list."
+            ),
+        )
 
     def handle(self, *args, **options) -> None:
         start, end = self._resolve_window(options)
@@ -91,7 +101,9 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("No matching active connections."))
             return
 
-        data_types = options["data_types"] or list(DEFAULT_DATA_TYPES)
+        # Pass-through: None means "let sync_user pick the default set" (which
+        # also expands to include rollup-only types when --resolution is set).
+        data_types = options["data_types"]
         self.stdout.write(
             f"Syncing {len(connections)} connection(s) over {start.isoformat()} → {end.isoformat()}"
         )
@@ -105,6 +117,7 @@ class Command(BaseCommand):
                     start=start,
                     end=end,
                     data_types=data_types,
+                    resolution_minutes=options["resolution_minutes"],
                     compute_basal=options["compute_basal"],
                 )
             except Exception:  # noqa: BLE001 — log + continue is the contract

@@ -72,7 +72,11 @@ HK_OXYGEN_SATURATION = "HKQuantityTypeIdentifierOxygenSaturation"
 HK_BODY_FAT_PERCENTAGE = "HKQuantityTypeIdentifierBodyFatPercentage"
 HK_HEIGHT = "HKQuantityTypeIdentifierHeight"
 
-# Map Google's sleep stage strings → healthdatamodel SleepValue.
+# Map Google's sleep stage strings → healthdatamodel SleepValue. Two known
+# stage taxonomies in the wild:
+#   * STAGES sleep type — LIGHT / DEEP / REM / AWAKE / IN_BED (or OUT_OF_BED)
+#   * CLASSIC sleep type — only ASLEEP / AWAKE / RESTLESS (no granularity)
+# Stage label lives at ``stages[].type`` (not ``stages[].stage``).
 _SLEEP_STAGE_MAP: dict[str, str] = {
     "LIGHT": SleepValue.ASLEEP_CORE,
     "DEEP": SleepValue.ASLEEP_DEEP,
@@ -81,6 +85,9 @@ _SLEEP_STAGE_MAP: dict[str, str] = {
     "IN_BED": SleepValue.IN_BED,
     "UNSPECIFIED": SleepValue.ASLEEP_UNSPECIFIED,
     "OUT_OF_BED": SleepValue.AWAKE,
+    # CLASSIC sleep type — coarse-grained
+    "ASLEEP": SleepValue.ASLEEP_UNSPECIFIED,
+    "RESTLESS": SleepValue.AWAKE,
 }
 
 
@@ -348,13 +355,24 @@ def map_height(data_point: dict[str, Any]) -> RecordInput:
 
 
 def map_sleep_session(data_point: dict[str, Any]) -> list[RecordInput]:
-    """Decompose a Google sleep session into one Record per stage interval."""
+    """Decompose a Google sleep session into one Record per stage interval.
+
+    Live payload puts stage bounds on the stage object directly
+    (``stages[].startTime`` / ``stages[].endTime``); earlier guesses assumed a
+    nested ``interval`` block. We accept both. Stage label is ``stages[].type``.
+    """
     block = data_point["sleep"]
     common = _common_record_fields(data_point)
     records: list[RecordInput] = []
     for stage in block.get("stages") or []:
-        start, end = _interval_bounds(stage)
-        mapped = _SLEEP_STAGE_MAP.get(str(stage.get("stage", "")).upper())
+        # Accept either flat (live) or nested (earlier-guessed) time shape.
+        if "startTime" in stage and "endTime" in stage:
+            start = _parse_dt(stage["startTime"])
+            end = _parse_dt(stage["endTime"])
+        else:
+            start, end = _interval_bounds(stage)
+        label = stage.get("type") or stage.get("stage", "")
+        mapped = _SLEEP_STAGE_MAP.get(str(label).upper())
         if mapped is None:
             continue
         records.append(
@@ -430,14 +448,117 @@ _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
     DATA_TYPE_HEIGHT: lambda dp: [map_height(dp)],
 }
 
-# Excluded from DEFAULT_DATA_TYPES because Google rejects ``list`` for them
-# ("List is not supported for data type X, but the following actions are
-# supported: import, rollup, dailyRollup, reconcile"). Fetching these requires a
-# separate dailyRollUp-based ingest path that we haven't built yet.
+# Google rejects ``list`` for these — only rollUp / dailyRollUp / reconcile work.
+# They're absent from DEFAULT_DATA_TYPES (so the default native-resolution sync
+# skips them) but become available when the caller passes
+# ``resolution_minutes=N`` to :func:`sync_user`.
 ROLLUP_ONLY_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_FLOORS,
 )
+
+# Types that don't support the rollUp endpoint at all (Sessions, point-in-time
+# Samples without an aggregation, pre-aggregated Daily summaries). When a
+# resolution is requested, these fall back to the native ``list`` endpoint.
+_ROLLUP_UNSUPPORTED_DATA_TYPES = frozenset(
+    {
+        DATA_TYPE_SLEEP,
+        DATA_TYPE_EXERCISE,
+        DATA_TYPE_HEIGHT,
+        DATA_TYPE_DAILY_RESTING_HEART_RATE,
+        DATA_TYPE_DAILY_OXYGEN_SATURATION,
+    }
+)
+
+
+def _rollup_value(
+    point: dict[str, Any], data_type: str
+) -> tuple[str, str | None] | None:
+    """Pull the aggregated value + unit from a rollupDataPoint for ``data_type``.
+
+    Returns ``(value, unit)`` or ``None`` if the point has no value for this type.
+    Field names are taken from the v4 discovery doc's ``*RollupValue`` schemas.
+    """
+    key = data_type.replace("-", "")  # rollup payload uses camelCase keys
+    # Map kebab-case data type → camelCase block name in the response.
+    block_key = {
+        DATA_TYPE_STEPS: "steps",
+        DATA_TYPE_DISTANCE: "distance",
+        DATA_TYPE_HEART_RATE: "heartRate",
+        DATA_TYPE_WEIGHT: "weight",
+        DATA_TYPE_BODY_FAT: "bodyFat",
+        DATA_TYPE_ALTITUDE: "altitude",
+        DATA_TYPE_TOTAL_CALORIES: "totalCalories",
+        DATA_TYPE_FLOORS: "floors",
+        DATA_TYPE_ACTIVE_ZONE_MINUTES: "activeZoneMinutes",
+    }.get(data_type, key)
+    block = point.get(block_key)
+    if not isinstance(block, dict):
+        return None
+    if data_type == DATA_TYPE_STEPS and "countSum" in block:
+        return str(block["countSum"]), "count"
+    if data_type == DATA_TYPE_FLOORS and "countSum" in block:
+        return str(block["countSum"]), "count"
+    if data_type == DATA_TYPE_DISTANCE and "millimetersSum" in block:
+        return str(float(block["millimetersSum"]) / 1000.0), "m"
+    if data_type == DATA_TYPE_ALTITUDE and "gainMillimetersSum" in block:
+        return str(float(block["gainMillimetersSum"]) / 1000.0), "m"
+    if data_type == DATA_TYPE_HEART_RATE and "beatsPerMinuteAvg" in block:
+        return str(block["beatsPerMinuteAvg"]), "count/min"
+    if data_type == DATA_TYPE_WEIGHT and "weightGramsAvg" in block:
+        return str(float(block["weightGramsAvg"]) / 1000.0), "kg"
+    if data_type == DATA_TYPE_BODY_FAT and "bodyFatPercentageAvg" in block:
+        return str(block["bodyFatPercentageAvg"]), "%"
+    if data_type == DATA_TYPE_TOTAL_CALORIES and "kcalSum" in block:
+        return str(block["kcalSum"]), "kcal"
+    if data_type == DATA_TYPE_ACTIVE_ZONE_MINUTES:
+        # Sum across all heart-rate zones for a single "active zone minutes" value.
+        total = 0
+        for field in (
+            "sumInFatBurnHeartZone",
+            "sumInCardioHeartZone",
+            "sumInPeakHeartZone",
+        ):
+            if field in block:
+                total += int(block[field])
+        return str(total), "min"
+    return None
+
+
+def _rollup_to_record(data_type: str, point: dict[str, Any]) -> RecordInput | None:
+    """Convert one ``rollupDataPoint`` to a :class:`RecordInput`."""
+    valued = _rollup_value(point, data_type)
+    if valued is None:
+        return None
+    value, unit = valued
+    start = _parse_dt(point["startTime"])
+    end = _parse_dt(point["endTime"])
+
+    # Map to the same HK identifier the native (list-path) mapper uses, so
+    # downstream queries see one consistent type per metric.
+    record_type = {
+        DATA_TYPE_STEPS: str(ActivityMetric.STEPS),
+        DATA_TYPE_DISTANCE: HK_DISTANCE_WALKING_RUNNING,
+        DATA_TYPE_HEART_RATE: HK_HEART_RATE,
+        DATA_TYPE_WEIGHT: HK_BODY_MASS,
+        DATA_TYPE_BODY_FAT: HK_BODY_FAT_PERCENTAGE,
+        DATA_TYPE_ALTITUDE: HK_ALTITUDE_GAIN,
+        DATA_TYPE_TOTAL_CALORIES: str(ActivityMetric.ACTIVE_CALORIES),
+        DATA_TYPE_FLOORS: HK_FLIGHTS_CLIMBED,
+        DATA_TYPE_ACTIVE_ZONE_MINUTES: HK_ACTIVE_ZONE_MINUTES,
+    }[data_type]
+
+    return RecordInput(
+        recordId=None,
+        startDate=start,
+        endDate=end,
+        creationDate=start,
+        sourceName=SOURCE_NAME,
+        type=record_type,
+        value=value,
+        unit=unit,
+    )
+
 
 DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_STEPS,
@@ -642,6 +763,7 @@ def sync_user(
     start: datetime,
     end: datetime,
     data_types: list[str] | None = None,
+    resolution_minutes: int | None = None,
     client: GoogleHealthClient | None = None,
     compute_basal: bool = True,
 ) -> SyncResult:
@@ -651,14 +773,65 @@ def sync_user(
     With ``compute_basal=True`` (default), runs :func:`compute_basal_calories`
     after the main ingest so a daily ``BASAL_CALORIES`` series is available
     for downstream MET calculations.
+
+    ``resolution_minutes`` switches the ingest path:
+
+    * ``None`` (default) — native granularity via the ``list`` endpoint. Each
+      Google data point becomes one Record. Sleep stages decompose into
+      per-stage records; exercise → Workout.
+
+    * positive int — aggregate via the ``rollUp`` endpoint with
+      ``windowSize={N*60}s`` (so ``1440`` gives one record per day). Each
+      rollup window becomes one Record. Data types that don't support
+      rollUp (sleep, exercise, height, daily-*) fall back to native.
+
+    With a resolution set, ``total-calories`` and ``floors`` become usable
+    (the ``list`` endpoint rejects them; ``rollUp`` is their only option).
     """
+    if resolution_minutes is not None and resolution_minutes <= 0:
+        raise ValueError("resolution_minutes must be positive or None")
+
     result = SyncResult()
     owns_client = client is None
     if client is None:
         client = GoogleHealthClient(connection)
 
+    requested = list(data_types or DEFAULT_DATA_TYPES)
+    if resolution_minutes is not None:
+        # Expand the default set with rollup-only types when a resolution is set.
+        if data_types is None:
+            for dt in ROLLUP_ONLY_DATA_TYPES:
+                if dt not in requested:
+                    requested.append(dt)
+
     try:
-        for data_type in data_types or DEFAULT_DATA_TYPES:
+        for data_type in requested:
+            use_rollup = (
+                resolution_minutes is not None
+                and data_type not in _ROLLUP_UNSUPPORTED_DATA_TYPES
+            )
+
+            if use_rollup:
+                window_seconds = resolution_minutes * 60
+                rollup_points = list(
+                    client.iter_roll_up(
+                        data_type,
+                        start=start,
+                        end=end,
+                        window_seconds=window_seconds,
+                    )
+                )
+                records = [
+                    rec
+                    for rec in (_rollup_to_record(data_type, p) for p in rollup_points)
+                    if rec is not None
+                ]
+                ingest_records(
+                    connection.customer, records, source=DataSource.GOOGLE_HEALTH
+                )
+                result.counts[data_type] = len(records)
+                continue
+
             filter_expr = _build_filter(data_type, start, end)
             data_points = list(client.iter_data_points(data_type, filter=filter_expr))
 

@@ -23,9 +23,20 @@ so callers can cross-reference Google's docs without translation.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 import httpx
+
+
+def _rfc3339(dt: datetime) -> str:
+    """Serialize a datetime as RFC3339 with a literal ``Z`` suffix, the format
+    Google's API expects for ``Interval.startTime`` / ``endTime``."""
+    return (
+        dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+        + "Z"
+    )
+
 
 from . import oauth
 from .constants import API_BASE_URL, API_VERSION
@@ -214,6 +225,37 @@ class GoogleHealthClient:
             f"users/me/dataTypes/{data_type}/dataPoints:rollUp",
             json=body,
         )
+
+    def iter_roll_up(
+        self,
+        data_type: str,
+        *,
+        start: datetime,
+        end: datetime,
+        window_seconds: int,
+        page_size: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Iterate ``rollupDataPoints`` across pages.
+
+        ``window_seconds`` is the aggregation window size; values up to one day
+        (86400) work for most types. Yields each ``RollupDataPoint`` as a dict.
+        """
+        body: dict[str, Any] = {
+            "range": {
+                "startTime": _rfc3339(start),
+                "endTime": _rfc3339(end),
+            },
+            "windowSize": f"{window_seconds}s",
+        }
+        if page_size is not None:
+            body["pageSize"] = page_size
+        while True:
+            page = self.roll_up(data_type, body)
+            yield from page.get("rollupDataPoints", [])
+            page_token = page.get("nextPageToken") or None
+            if not page_token:
+                return
+            body = {**body, "pageToken": page_token}
 
 
 def _safe_json(response: httpx.Response) -> Any:
