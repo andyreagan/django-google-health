@@ -55,6 +55,7 @@ DATA_TYPE_SLEEP = "sleep"
 DATA_TYPE_STEPS = "steps"
 DATA_TYPE_TOTAL_CALORIES = "total-calories"
 DATA_TYPE_WEIGHT = "weight"
+DATA_TYPE_HEIGHT = "height"
 DATA_TYPE_DAILY_RESTING_HEART_RATE = "daily-resting-heart-rate"
 DATA_TYPE_DAILY_OXYGEN_SATURATION = "daily-oxygen-saturation"
 

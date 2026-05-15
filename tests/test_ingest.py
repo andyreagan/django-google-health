@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import respx
@@ -290,6 +290,22 @@ def test_map_body_fat():
     assert rec.startDate == rec.endDate
 
 
+def test_map_height():
+    dp = {
+        "name": "users/x/dataTypes/height/dataPoints/h1",
+        "height": {
+            "time": "2026-05-01T08:00:00Z",
+            "heightMeters": 1.78,
+            "updateTime": "2026-05-01T08:00:01Z",
+        },
+    }
+    rec = ingest.map_height(dp)
+    assert rec.type == ingest.HK_HEIGHT
+    assert rec.value == "1.78"
+    assert rec.unit == "m"
+    assert rec.startDate == rec.endDate
+
+
 def test_default_data_types_includes_all_mapped_types():
     """Ensure the default sweep covers every mapper we expose."""
     assert set(ingest.DEFAULT_DATA_TYPES) >= {
@@ -465,6 +481,7 @@ def test_sync_user_persists_each_data_type(connection, customer):
             DATA_TYPE_SLEEP,
             DATA_TYPE_EXERCISE,
         ],
+        compute_basal=False,
     )
 
     # Per-type counts
@@ -508,6 +525,7 @@ def test_sync_user_respects_data_types_argument(connection):
         start=datetime(2026, 5, 1, tzinfo=timezone.utc),
         end=datetime(2026, 5, 2, tzinfo=timezone.utc),
         data_types=[DATA_TYPE_STEPS],
+        compute_basal=False,
     )
 
     assert list(result.counts.keys()) == [DATA_TYPE_STEPS]
@@ -542,10 +560,153 @@ def test_sync_user_handles_expired_token(customer):
         start=datetime(2026, 5, 1, tzinfo=timezone.utc),
         end=datetime(2026, 5, 2, tzinfo=timezone.utc),
         data_types=[DATA_TYPE_STEPS],
+        compute_basal=False,
     )
 
     conn.refresh_from_db()
     assert conn.access_token == "ya29.fresh"
+
+
+# ---------------------------------------------------------------------------
+# compute_basal_calories
+# ---------------------------------------------------------------------------
+
+
+def _seed_height_weight(customer, *, height_m: float, weight_kg: float, when: datetime):
+    """Seed Record rows so compute_basal_calories has weight + height to read."""
+    from healthdatamodel.models import Record
+
+    common = {
+        "customer": customer,
+        "startDate": when,
+        "endDate": when,
+        "creationDate": when,
+        "admin_create_date": when,
+        "sourceName": "seed",
+        "source": DataSource.GOOGLE_HEALTH,
+    }
+    Record.objects.create(
+        **common, type=ingest.HK_HEIGHT, value=str(height_m), unit="m"
+    )
+    Record.objects.create(
+        **common, type=ingest.HK_BODY_MASS, value=str(weight_kg), unit="kg"
+    )
+
+
+@pytest.mark.django_db
+def test_compute_basal_calories_uses_mifflin_when_height_weight_available(connection):
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    customer = connection.customer
+    seed_when = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    _seed_height_weight(customer, height_m=1.80, weight_kg=80.0, when=seed_when)
+
+    from healthdatamodel.bmr import age_from_dob, calculate_bmr
+
+    dob = date(1990, 1, 1)
+    profile = {"birthday": dob.isoformat(), "gender": "MALE"}
+    start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 3, tzinfo=timezone.utc)
+
+    count = ingest.compute_basal_calories(
+        connection, start=start, end=end, profile=profile
+    )
+
+    assert count == 3  # May 1, 2, 3
+    records = Record.objects.filter(
+        customer=customer, type=str(ActivityMetric.BASAL_CALORIES)
+    ).order_by("startDate")
+    assert records.count() == 3
+    expected = calculate_bmr(age_from_dob(dob), "M", 80.0, 180.0)
+    for rec in records:
+        assert float(rec.value) == pytest.approx(expected, rel=1e-6)
+    assert {r.unit for r in records} == {"kcal"}
+
+
+@pytest.mark.django_db
+def test_compute_basal_calories_falls_back_to_lookup_when_records_missing(connection):
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    profile = {"birthday": "1990-05-15", "gender": "MALE"}
+    count = ingest.compute_basal_calories(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        profile=profile,
+    )
+    assert count == 1
+    rec = Record.objects.get(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    )
+    # get_bmr's lookup table for a 35yo male yields a positive BMR, not the
+    # 2000 default — we don't pin the exact value (the tables drift over time).
+    assert float(rec.value) > 1000.0
+
+
+@pytest.mark.django_db
+def test_compute_basal_calories_returns_default_when_profile_blank(connection):
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+    from healthdatamodel.bmr import DEFAULT_BMR
+
+    count = ingest.compute_basal_calories(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        profile={},
+    )
+    assert count == 1
+    rec = Record.objects.get(
+        customer=connection.customer, type=str(ActivityMetric.BASAL_CALORIES)
+    )
+    assert float(rec.value) == DEFAULT_BMR
+
+
+@pytest.mark.django_db
+def test_compute_basal_calories_handles_civil_date_dob(connection):
+    """Google's civil-date {year, month, day} shape should parse like ISO strings."""
+    count = ingest.compute_basal_calories(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        profile={"birthday": {"year": 1990, "month": 5, "day": 15}, "gender": "FEMALE"},
+    )
+    assert count == 1
+
+
+@respx.mock
+def test_sync_user_with_compute_basal_calls_profile_and_persists(connection):
+    """Wired through sync_user: the basal step runs after the main loop."""
+    from healthdatamodel.models import Record
+    from healthdatamodel.query import ActivityMetric
+
+    customer = connection.customer
+    seed_when = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    _seed_height_weight(customer, height_m=1.65, weight_kg=60.0, when=seed_when)
+
+    respx.get(_dp_url(DATA_TYPE_STEPS)).mock(return_value=Response(200, json=_page([])))
+    respx.get(f"{API_BASE_URL}/{API_VERSION}/users/me/profile").mock(
+        return_value=Response(200, json={"birthday": "1995-01-01", "gender": "F"})
+    )
+
+    result = ingest.sync_user(
+        connection,
+        start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        data_types=[DATA_TYPE_STEPS],
+        compute_basal=True,
+    )
+
+    assert result.counts[DATA_TYPE_STEPS] == 0
+    assert result.counts["basal-calories"] == 2  # 2026-05-01, 2026-05-02
+    assert (
+        Record.objects.filter(
+            customer=customer, type=str(ActivityMetric.BASAL_CALORIES)
+        ).count()
+        == 2
+    )
 
 
 @pytest.mark.live

@@ -25,11 +25,14 @@ The high-level orchestrator is :func:`sync_user`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+import dateutil.parser
+from healthdatamodel.bmr import age_from_dob, calculate_bmr, get_bmr
 from healthdatamodel.constants import DataSource
 from healthdatamodel.ingest import ingest_records, ingest_workouts
+from healthdatamodel.models import Record
 from healthdatamodel.query import SLEEP_TYPE, ActivityMetric, SleepValue
 from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 
@@ -44,6 +47,7 @@ from .constants import (
     DATA_TYPE_EXERCISE,
     DATA_TYPE_FLOORS,
     DATA_TYPE_HEART_RATE,
+    DATA_TYPE_HEIGHT,
     DATA_TYPE_SLEEP,
     DATA_TYPE_STEPS,
     DATA_TYPE_TOTAL_CALORIES,
@@ -66,6 +70,7 @@ HK_ACTIVE_ZONE_MINUTES = "HKQuantityTypeIdentifierAppleExerciseTime"
 HK_RESTING_HEART_RATE = "HKQuantityTypeIdentifierRestingHeartRate"
 HK_OXYGEN_SATURATION = "HKQuantityTypeIdentifierOxygenSaturation"
 HK_BODY_FAT_PERCENTAGE = "HKQuantityTypeIdentifierBodyFatPercentage"
+HK_HEIGHT = "HKQuantityTypeIdentifierHeight"
 
 # Map Google's sleep stage strings → healthdatamodel SleepValue.
 _SLEEP_STAGE_MAP: dict[str, str] = {
@@ -290,6 +295,21 @@ def map_body_fat(data_point: dict[str, Any]) -> RecordInput:
     )
 
 
+def map_height(data_point: dict[str, Any]) -> RecordInput:
+    """Height Sample (point in time). Google reports meters."""
+    block = data_point["height"]
+    instant = _parse_dt(block.get("time"))
+    height_m = float(block.get("heightMeters") or block.get("heightM") or 0)
+    return RecordInput(
+        **_common_record_fields(data_point),
+        startDate=instant,
+        endDate=instant,
+        type=HK_HEIGHT,
+        value=str(height_m),
+        unit="m",
+    )
+
+
 def map_sleep_session(data_point: dict[str, Any]) -> list[RecordInput]:
     """Decompose a Google sleep session into one Record per stage interval."""
     block = data_point["sleep"]
@@ -370,6 +390,7 @@ _RECORD_MAPPERS: dict[str, Callable[[dict[str, Any]], list[RecordInput]]] = {
     DATA_TYPE_DAILY_RESTING_HEART_RATE: lambda dp: [map_daily_resting_heart_rate(dp)],
     DATA_TYPE_DAILY_OXYGEN_SATURATION: lambda dp: [map_daily_oxygen_saturation(dp)],
     DATA_TYPE_BODY_FAT: lambda dp: [map_body_fat(dp)],
+    DATA_TYPE_HEIGHT: lambda dp: [map_height(dp)],
 }
 
 DEFAULT_DATA_TYPES: tuple[str, ...] = (
@@ -377,6 +398,7 @@ DEFAULT_DATA_TYPES: tuple[str, ...] = (
     DATA_TYPE_TOTAL_CALORIES,
     DATA_TYPE_HEART_RATE,
     DATA_TYPE_WEIGHT,
+    DATA_TYPE_HEIGHT,
     DATA_TYPE_SLEEP,
     DATA_TYPE_EXERCISE,
     DATA_TYPE_DISTANCE,
@@ -396,6 +418,136 @@ def _interval_filter(google_filter_key: str, start: datetime, end: datetime) -> 
     )
 
 
+# Basal calories --------------------------------------------------------------
+
+
+_BASAL_RESULT_KEY = "basal-calories"
+
+
+def _profile_dob_and_gender(profile: dict[str, Any]) -> tuple[datetime | None, str]:
+    """Best-effort extraction of DOB + gender from Google Health profile payload.
+
+    Google's profile schema isn't fully documented; we try the most common
+    spellings. Returns ``(None, "")`` when either field can't be resolved —
+    callers fall back to the median-table BMR via :func:`get_bmr`.
+    """
+    dob_raw = (
+        profile.get("dateOfBirth")
+        or profile.get("birthday")
+        or profile.get("birthDate")
+    )
+    dob: datetime | None = None
+    if isinstance(dob_raw, str):
+        try:
+            dob = dateutil.parser.parse(dob_raw)
+        except (ValueError, TypeError):
+            dob = None
+    elif isinstance(dob_raw, dict):
+        # Google sometimes uses civil-date {"year": ..., "month": ..., "day": ...}.
+        try:
+            dob = datetime(
+                int(dob_raw["year"]), int(dob_raw["month"]), int(dob_raw["day"])
+            )
+        except (KeyError, TypeError, ValueError):
+            dob = None
+
+    gender_raw = str(profile.get("gender") or profile.get("sex") or "").upper()
+    if gender_raw.startswith("M"):
+        gender = "M"
+    elif gender_raw.startswith("F"):
+        gender = "F"
+    else:
+        gender = ""
+
+    return dob, gender
+
+
+def _latest_value_at_or_before(customer: Any, hk_type: str, day: date) -> float | None:
+    cutoff = datetime.combine(
+        day + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+    )
+    record = (
+        Record.objects.filter(customer=customer, type=hk_type, startDate__lt=cutoff)
+        .order_by("-startDate")
+        .first()
+    )
+    if record is None:
+        return None
+    try:
+        return float(record.value)
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_basal_calories(
+    connection: GoogleHealthConnection,
+    *,
+    start: datetime,
+    end: datetime,
+    profile: dict[str, Any] | None = None,
+    client: GoogleHealthClient | None = None,
+    admin_create_date: datetime | None = None,
+) -> int:
+    """Estimate daily BMR for every day in [start, end] and persist as
+    ``ActivityMetric.BASAL_CALORIES`` records.
+
+    Uses Mifflin-St Jeor (:func:`healthdatamodel.bmr.calculate_bmr`) when
+    height + weight are both available on or before each day, falling back to
+    the median-table lookup (:func:`healthdatamodel.bmr.get_bmr`) when either
+    is missing.
+
+    Pass ``profile`` to skip the HTTP call (handy in tests). If both
+    ``profile`` and ``client`` are ``None``, a transient ``GoogleHealthClient``
+    is built for the profile fetch only.
+    """
+    owns_client = False
+    if profile is None:
+        owns_client = client is None
+        if client is None:
+            client = GoogleHealthClient(connection)
+        try:
+            profile = client.get_profile()
+        finally:
+            if owns_client:
+                client.close()
+
+    dob, gender = _profile_dob_and_gender(profile or {})
+    age = age_from_dob(dob.date()) if dob is not None else None
+
+    customer = connection.customer
+    creation = admin_create_date or datetime.now(timezone.utc)
+    records: list[RecordInput] = []
+    day = start.date()
+    end_day = end.date()
+    while day <= end_day:
+        weight = _latest_value_at_or_before(customer, HK_BODY_MASS, day)
+        height_m = _latest_value_at_or_before(customer, HK_HEIGHT, day)
+
+        if weight is not None and height_m is not None and age is not None and gender:
+            bmr = calculate_bmr(age, gender, weight, height_m * 100.0)
+        else:
+            bmr = get_bmr(age=age, gender=gender)
+
+        day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        records.append(
+            RecordInput(
+                recordId=f"basal-{day.isoformat()}",
+                startDate=day_start,
+                endDate=day_end,
+                creationDate=creation,
+                sourceName=SOURCE_NAME,
+                type=str(ActivityMetric.BASAL_CALORIES),
+                value=str(bmr),
+                unit="kcal",
+            )
+        )
+        day += timedelta(days=1)
+
+    ingest_records(customer, records, source=DataSource.GOOGLE_HEALTH)
+    return len(records)
+
+
 def sync_user(
     connection: GoogleHealthConnection,
     *,
@@ -403,10 +555,14 @@ def sync_user(
     end: datetime,
     data_types: list[str] | None = None,
     client: GoogleHealthClient | None = None,
+    compute_basal: bool = True,
 ) -> SyncResult:
     """Fetch + ingest all configured data types for ``connection`` over [start, end].
 
     Pass a pre-built ``client`` to override the default (useful in tests).
+    With ``compute_basal=True`` (default), runs :func:`compute_basal_calories`
+    after the main ingest so a daily ``BASAL_CALORIES`` series is available
+    for downstream MET calculations.
     """
     result = SyncResult()
     owns_client = client is None
@@ -437,6 +593,14 @@ def sync_user(
                 connection.customer, records, source=DataSource.GOOGLE_HEALTH
             )
             result.counts[data_type] = len(records)
+
+        if compute_basal:
+            # Computed AFTER the main loop so the latest weight/height records
+            # this sync brought in are picked up by _latest_value_at_or_before.
+            basal_count = compute_basal_calories(
+                connection, start=start, end=end, client=client
+            )
+            result.counts[_BASAL_RESULT_KEY] = basal_count
     finally:
         if owns_client:
             client.close()

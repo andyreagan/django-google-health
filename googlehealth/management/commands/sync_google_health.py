@@ -75,6 +75,13 @@ class Command(BaseCommand):
             default=None,
             help="Restrict to this data type. Repeatable. Default: all configured types.",
         )
+        parser.add_argument(
+            "--no-basal",
+            dest="compute_basal",
+            action="store_false",
+            default=True,
+            help="Skip computing/persisting per-day basal calories (Mifflin-St Jeor).",
+        )
 
     def handle(self, *args, **options) -> None:
         start, end = self._resolve_window(options)
@@ -94,7 +101,11 @@ class Command(BaseCommand):
             label = f"customer={connection.customer_id} ({connection.google_user_id})"
             try:
                 result = sync_user(
-                    connection, start=start, end=end, data_types=data_types
+                    connection,
+                    start=start,
+                    end=end,
+                    data_types=data_types,
+                    compute_basal=options["compute_basal"],
                 )
             except Exception:  # noqa: BLE001 — log + continue is the contract
                 log.exception("sync_user failed for %s", label)

@@ -111,6 +111,22 @@ def test_data_type_filter_passed_through(two_active_connections):
     assert m.call_args.kwargs["data_types"] == ["steps", "sleep"]
 
 
+def test_basal_defaults_on(two_active_connections):
+    out = StringIO()
+    with patch("googlehealth.management.commands.sync_google_health.sync_user") as m:
+        m.return_value = _fake_result()
+        call_command("sync_google_health", stdout=out)
+    assert m.call_args.kwargs["compute_basal"] is True
+
+
+def test_no_basal_flag_disables_basal(two_active_connections):
+    out = StringIO()
+    with patch("googlehealth.management.commands.sync_google_health.sync_user") as m:
+        m.return_value = _fake_result()
+        call_command("sync_google_health", "--no-basal", stdout=out)
+    assert m.call_args.kwargs["compute_basal"] is False
+
+
 def test_skips_disconnected_and_revoked(customer):
     GoogleHealthConnection.objects.create(
         customer=customer,
